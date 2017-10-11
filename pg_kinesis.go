@@ -1,13 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
-	"hash/fnv"
 	"os"
 	"os/signal"
+	"regexp"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -15,7 +15,6 @@ import (
 )
 
 import (
-	"github.com/a8m/kinesis-producer"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kinesis"
@@ -23,6 +22,7 @@ import (
 	"github.com/jackc/pgx"
 	"github.com/nickelser/parselogical"
 
+	"github.com/jpillora/backoff"
 	"github.com/pkg/errors"
 	"github.com/tevino/abool"
 )
@@ -42,7 +42,7 @@ Options:
   --drop                Drop the specified replication slot. Exits upon success.
   -t --table            Table to transfer. Multiple tables can be selected by writing multiple -t switches. Defaults to all tables. The matching semantics are the same as psql (https://www.postgresql.org/docs/current/static/app-psql.html#app-psql-patterns)
   -T --exclude-table    Table to exclude. Defaults to excluding no tables. The matching logic is the same as for -t; -T has higher precedence than -t.
-  --retry-slot          If this flag is present, retry the initial connection to the replication slot; useful for high-availability setups where the same pg_kinesis command is run from multiple hosts.
+  --retry-initial       If this flag is present, retry the initial connection to the replication slot; useful for high-availability setups where the same pg_kinesis command is run from multiple hosts.
 `
 
 // DefaultKeepaliveTimeout is the time before we proactively send a keepalive & status update
@@ -54,13 +54,21 @@ const ReplicationLoopInterval = 1 * time.Second
 // ReconnectInterval is the time between connection attempts
 const ReconnectInterval = 1 * time.Second
 
-// StatsInterval is the time between statistics reporting
-const StatsInterval = 5 * time.Second
+// InitialReconnectInterval is the time interval between initial connection attempts (for HA setups)
+const InitialReconnectInterval = 5 * time.Second
 
-var walLock sync.Mutex
-var maxWal uint64
-var maxWalSent uint64
-var lastStatus time.Time
+// StatsInterval is the time between statistics reporting
+const StatsInterval = 10 * time.Second
+
+// FlushInterval is the interval between forced Kinesis flushes
+const FlushInterval = 1 * time.Second
+
+const (
+	maxRecordSize         = 1 << 20 // 1MiB
+	maxRequestSize        = 5 << 20 // 5MiB
+	maxRecordsPerRequest  = 500
+	defaultMaxConnections = 24
+)
 
 var stats struct {
 	sync.Mutex
@@ -71,19 +79,31 @@ var stats struct {
 	skipped uint64
 }
 
-type tableList map[string]bool
-
-var tables tableList
-var hasTables bool
-
-var stmts map[string]bool
-var pks map[string]string
-var cols map[string]map[string]bool
-
 var sigs = make(chan os.Signal, 1)
 var restart = make(chan bool, 1)
 var shutdown = make(chan bool, 1)
+var flush = make(chan bool, 1)
 var done = abool.New()
+
+var walLock sync.Mutex
+var maxWal uint64
+var maxWalSent uint64
+var lastStatus time.Time
+var lastFlush time.Time
+
+type tableList []*regexp.Regexp
+
+var tables tableList
+var excludedTables tableList
+
+var kinesisClient *kinesis.Kinesis
+
+var records []*kinesis.PutRecordsRequestEntry
+var lastMsg *pgx.ReplicationMessage
+
+var tablesToStream map[string]bool
+
+var initiallyConnected = false
 
 func logerror(err error) {
 	if err != nil {
@@ -106,73 +126,129 @@ func print(a ...interface{}) {
 	fmt.Fprintln(os.Stdout, file, ":", line, " ", fmt.Sprint(a...))
 }
 
-func stmtNameFromPTD(ptd *parselogical.ParsedTestDecoding) (string, []string) {
-	h := fnv.New64a()
-
-	h.Write([]byte(ptd.Schema))
-	h.Write([]byte(ptd.Table))
-
-	keys := make([]string, 0, len(ptd.Fields))
-	for k := range ptd.Fields {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys) // ensure the fields are sorted
-
-	for _, k := range keys {
-		h.Write([]byte(k))
+func flushRecords(stream *string) (bool, error) {
+	if len(records) == 0 {
+		return false, nil
 	}
 
-	return fmt.Sprintf("insert_%x", h.Sum64()), keys
-}
-
-func prepareStmtFromParsed(conn *pgx.Conn, ptd *parselogical.ParsedTestDecoding) (string, []string, error) {
-	stmtName, keys := stmtNameFromPTD(ptd)
-
-	if _, ok := stmts[stmtName]; ok {
-		return stmtName, keys, nil
+	b := &backoff.Backoff{
+		Jitter: true,
 	}
 
-	pk, ok := pks[ptd.SchemaTable]
+	for b.Attempt() < 100 && !done.IsSet() {
+		retryDuration := b.Duration()
 
-	if !ok {
-		return stmtName, keys, errors.Errorf("unknown primary key for table %s", ptd.SchemaTable)
-	}
+		startTime := time.Now()
+		out, err := kinesisClient.PutRecords(&kinesis.PutRecordsInput{
+			StreamName: stream,
+			Records:    records,
+		})
+		elapsed := time.Since(startTime)
 
-	// TODO: decide on variable column handling
-	// cmap, ok := cols[tableSchema]
-
-	// if !ok {
-	// 	return stmtName, keys, errors.Errorf("unknown columns list for table %s", tableSchema)
-	// }
-
-	insertPrefix := fmt.Sprintf("INSERT INTO %s (", ptd.SchemaTable)
-	values := "VALUES ("
-	conflictSuffix := fmt.Sprintf("ON CONFLICT (%s) DO UPDATE SET ", pk)
-
-	for i, k := range keys {
-		insertPrefix += k + ","
-		values += fmt.Sprintf("$%d,", i+1)
-		if k != pk {
-			conflictSuffix += fmt.Sprintf("%s = excluded.%s,", k, k)
+		if err != nil {
+			logerror(errors.Wrapf(err, "kinesis PutRecords failed; retrying failed records in %s", retryDuration.String()))
+			time.Sleep(retryDuration)
+		} else if *out.FailedRecordCount > 0 {
+			logerrf("%d records failed during Kinesis PutRecords; retrying in %s", *out.FailedRecordCount, retryDuration.String())
+			records = failures(records, out.Records)
+			time.Sleep(retryDuration)
+		} else if *out.FailedRecordCount == 0 {
+			logf("put %d records to Kinesis in %s", len(records), elapsed)
+			records = nil
+			return true, nil
 		}
 	}
 
-	conflictSuffix = strings.TrimSuffix(conflictSuffix, ",")
-	insertPrefix = strings.TrimSuffix(insertPrefix, ",") + ") "
-	values = strings.TrimSuffix(values, ",") + ") "
-
-	_, err := conn.PrepareEx(stmtName, insertPrefix+values+conflictSuffix, nil)
-
-	if err != nil {
-		return "", keys, err
+	if done.IsSet() {
+		return false, errors.New("interrupted PutRecords due to shutdown")
 	}
 
-	stmts[stmtName] = true
-
-	return stmtName, keys, nil
+	return false, errors.New("failed to put records after many attempts")
 }
 
-func replicateMsg(targetConn *pgx.Conn, msg *pgx.ReplicationMessage) error {
+func putRecord(jsonRecord []byte, tableSchema *string, stream *string) (bool, error) {
+	if len(jsonRecord) > maxRecordSize {
+		return false, errors.New("replication messages must be less than 1MB in size")
+	}
+
+	records = append(records, &kinesis.PutRecordsRequestEntry{
+		Data:         jsonRecord,
+		PartitionKey: tableSchema,
+	})
+
+	if len(records) < maxRecordsPerRequest {
+		return false, nil
+	}
+
+	return flushRecords(stream)
+}
+
+func failures(records []*kinesis.PutRecordsRequestEntry,
+	response []*kinesis.PutRecordsResultEntry) (out []*kinesis.PutRecordsRequestEntry) {
+	for i, record := range response {
+		if record.ErrorCode != nil {
+			out = append(out, records[i])
+		}
+	}
+	return out
+}
+
+func marshalTypedNullString(tns *parselogical.TypedNullString) map[string]string {
+	if tns.Valid {
+		return map[string]string{"v": tns.String}
+	}
+
+	return map[string]string{"n": "true"}
+}
+
+func marshalTypedNullStringPair(newValue *parselogical.TypedNullString, oldValue *parselogical.TypedNullString) map[string]map[string]string {
+	if oldValue != nil && newValue != nil {
+		return map[string]map[string]string{
+			"old": marshalTypedNullString(oldValue),
+			"cur": marshalTypedNullString(newValue),
+		}
+	} else if newValue != nil {
+		return map[string]map[string]string{
+			"cur": marshalTypedNullString(newValue),
+		}
+	} else if oldValue != nil {
+		return map[string]map[string]string{
+			"old": marshalTypedNullString(oldValue),
+		}
+	}
+
+	return nil
+}
+
+func marshalPTDToJSON(ptd *parselogical.ParsedTestDecoding) ([]byte, error) {
+	columns := make(map[string]map[string]map[string]string)
+
+	for k, v := range ptd.Fields {
+		oldV, ok := ptd.OldFields[k]
+
+		if ptd.Operation == "DELETE" {
+			columns[k] = marshalTypedNullStringPair(nil, &v)
+		} else {
+			if ok && v.String != oldV.String {
+				columns[k] = marshalTypedNullStringPair(&v, &oldV)
+			} else {
+				columns[k] = marshalTypedNullStringPair(&v, nil)
+			}
+		}
+	}
+
+	return json.Marshal(struct {
+		Table     *string                                  `json:"table"`
+		Operation *string                                  `json:"operation"`
+		Columns   *map[string]map[string]map[string]string `json:"columns"`
+	}{
+		Table:     &ptd.SchemaTable,
+		Operation: &ptd.Operation,
+		Columns:   &columns,
+	})
+}
+
+func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 	var err error
 
 	walString := string(msg.WalMessage.WalData)
@@ -191,12 +267,32 @@ func replicateMsg(targetConn *pgx.Conn, msg *pgx.ReplicationMessage) error {
 	stats.Lock()
 	defer stats.Unlock()
 
-	if hasTables {
-		if _, ok := tables[ptd.SchemaTable]; !ok {
-			stats.skipped++
-			ack(msg)
-			return nil
+	include, ok := tablesToStream[ptd.SchemaTable]
+
+	if !ok {
+		include = len(tables) == 0
+
+		for _, tblRegex := range tables {
+			if tblRegex.MatchString(ptd.SchemaTable) {
+				include = true
+				break
+			}
 		}
+
+		for _, tblRegex := range excludedTables {
+			if tblRegex.MatchString(ptd.SchemaTable) {
+				include = false
+				break
+			}
+		}
+
+		tablesToStream[ptd.SchemaTable] = include
+	}
+
+	if !include {
+		stats.skipped++
+		ack(msg)
+		return nil
 	}
 
 	switch ptd.Operation {
@@ -208,47 +304,32 @@ func replicateMsg(targetConn *pgx.Conn, msg *pgx.ReplicationMessage) error {
 		stats.deletes++
 	}
 
-	if ptd.Operation != "UPDATE" && ptd.Operation != "INSERT" {
-		ack(msg)
-		return nil
-	}
-
 	err = ptd.ParseColumns()
 
 	if err != nil {
 		return errors.Wrapf(err, "unable to parse columns of the replication message: %s", walString)
 	}
 
-	preparedStmt, keys, err := prepareStmtFromParsed(targetConn, ptd)
+	if err != nil {
+		return errors.Wrap(err, "error serializing WAL record into JSON")
+	}
+
+	jsonRecord, err := marshalPTDToJSON(ptd)
+	lastMsg = msg
+	flushed, err := putRecord(jsonRecord, &ptd.SchemaTable, stream)
 
 	if err != nil {
-		return errors.Wrap(err, "unable to prepare insertion statement")
+		return errors.Wrap(err, "unable to put record into Kinesis")
 	}
 
-	toInsert := make([]interface{}, len(ptd.Fields))
-
-	for i, k := range keys {
-		v := ptd.Fields[k]
-
-		if v.Valid {
-			toInsert[i] = v.String
-		} else {
-			toInsert[i] = nil
-		}
+	if flushed {
+		ack(msg)
 	}
-
-	_, err = targetConn.Exec(preparedStmt, toInsert...)
-
-	if err != nil {
-		return errors.Wrap(err, "unable to insert row")
-	}
-
-	ack(msg)
 
 	return nil
 }
 
-func replicationLoop(targetConn *pgx.Conn, replicationMessages chan *pgx.ReplicationMessage, replicationFinished chan error) {
+func replicationLoop(replicationMessages chan *pgx.ReplicationMessage, replicationFinished chan error, stream *string) {
 	var msg *pgx.ReplicationMessage
 
 	for {
@@ -259,14 +340,24 @@ func replicationLoop(targetConn *pgx.Conn, replicationMessages chan *pgx.Replica
 		case <-shutdown:
 			logerrf("shutting down replication loop")
 			return
+		case <-flush:
+			flushed, err := flushRecords(stream)
+
+			if err != nil {
+				replicationFinished <- err // already wrapped
+				return
+			}
+
+			if flushed {
+				ack(lastMsg)
+			}
 		case msg = <-replicationMessages:
-		}
+			err := handleReplicationMsg(msg, stream)
 
-		err := replicateMsg(targetConn, msg)
-
-		if err != nil {
-			replicationFinished <- err // already wrapped
-			return
+			if err != nil {
+				replicationFinished <- err // already wrapped
+				return
+			}
 		}
 	}
 }
@@ -274,6 +365,8 @@ func replicationLoop(targetConn *pgx.Conn, replicationMessages chan *pgx.Replica
 func ack(msg *pgx.ReplicationMessage) {
 	walLock.Lock()
 	defer walLock.Unlock()
+
+	// todo: persist into dynamodb
 
 	if msg.WalMessage.WalStart > maxWal {
 		maxWal = msg.WalMessage.WalStart
@@ -302,86 +395,7 @@ func sendKeepalive(conn *pgx.ReplicationConn, force bool) error {
 	return nil
 }
 
-func fetchPKs(conn *pgx.Conn) error {
-	rows, err := conn.Query(`
-		SELECT tc.table_schema || '.' || tc.table_name, kc.column_name
-		FROM
-			information_schema.table_constraints tc,
-			information_schema.key_column_usage kc
-		WHERE
-			tc.constraint_type = 'PRIMARY KEY'
-			AND kc.table_name = tc.table_name and kc.table_schema = tc.table_schema
-			AND kc.constraint_name = tc.constraint_name`)
-	if err != nil {
-		return err
-	}
-
-	defer rows.Close()
-
-	pks = make(map[string]string)
-
-	// Iterate through the result set
-	for rows.Next() {
-		var schemaTable string
-		var pk string
-
-		err = rows.Scan(&schemaTable, &pk)
-		if err != nil {
-			return err
-		}
-
-		pks[schemaTable] = pk
-	}
-
-	if rows.Err() != nil {
-		return err
-	}
-
-	return nil
-}
-
-func fetchColumns(conn *pgx.Conn) error {
-	rows, err := conn.Query(`
-		SELECT table_schema || '.' || table_name, ARRAY_AGG(column_name::text) AS columns
-		FROM information_schema.columns
-		WHERE table_schema != 'pg_catalog'
-					AND table_schema != 'information_schema'
-		GROUP BY table_schema, table_name`)
-	if err != nil {
-		return err
-	}
-
-	defer rows.Close()
-
-	cols = make(map[string]map[string]bool)
-
-	// Iterate through the result set
-	for rows.Next() {
-		var tableSchema string
-		var tableCols []string
-
-		cmap := make(map[string]bool)
-
-		err = rows.Scan(&tableSchema, &tableCols)
-		if err != nil {
-			return err
-		}
-
-		for _, col := range tableCols {
-			cmap[col] = true
-		}
-
-		cols[tableSchema] = cmap
-	}
-
-	if rows.Err() != nil {
-		return err
-	}
-
-	return nil
-}
-
-func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, targetConfig pgx.ConnConfig) error {
+func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *string) error {
 	var err error
 	var replErr error
 
@@ -391,45 +405,21 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, targetConfi
 	}
 	defer conn.Close()
 
-	targetConn, err := pgx.Connect(targetConfig)
-	if err != nil {
-		return errors.Wrapf(err, "unable to establish connection to target DB %s/%s", targetConfig.Host, targetConfig.Database)
-	}
-	defer targetConn.Close()
-
-	err = fetchPKs(targetConn)
-	if err != nil {
-		return errors.Wrap(err, "unable to fetch primary keys from target DB")
-	}
-
-	err = fetchColumns(targetConn)
-	if err != nil {
-		return errors.Wrap(err, "unable to fetch column listing from target DB")
-	}
-
-	if hasTables {
-		for tbl := range tables {
-			if _, ok := cols[tbl]; !ok {
-				logerrf("missing table '%s' on target DB", tbl)
-				os.Exit(1)
-			}
-		}
-	}
-
 	err = conn.StartReplication(*slot, 0, -1)
 	if err != nil {
 		return errors.Wrapf(err, "unable to start replication to slot %s", *slot)
 	}
 
 	lastStatus = time.Now()
+	initiallyConnected = true
 
 	replicationMessages := make(chan *pgx.ReplicationMessage)
 	replicationFinished := make(chan error, 1)
-	stmts = make(map[string]bool)
 
 	lastStats := time.Now()
+	lastFlush := time.Now()
 
-	go replicationLoop(targetConn, replicationMessages, replicationFinished)
+	go replicationLoop(replicationMessages, replicationFinished, stream)
 
 	logf("replication started at %v starting from LSN %s", lastStatus, pgx.FormatLSN(maxWalSent))
 
@@ -438,8 +428,6 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, targetConfi
 		keepaliveRequested := false
 
 		message, err = conn.WaitForReplicationMessage(ReplicationLoopInterval)
-
-		logf("got message! %s", message)
 
 		if err != nil {
 			if err != pgx.ErrNotificationTimeout {
@@ -469,6 +457,13 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, targetConfi
 		err = sendKeepalive(conn, keepaliveRequested)
 		if err != nil {
 			return errors.Wrap(err, "unable to send keepalive")
+		}
+
+		sinceLastFlush := time.Since(lastFlush)
+
+		if sinceLastFlush >= FlushInterval {
+			flush <- true
+			lastFlush = time.Now()
 		}
 
 		sinceLastStats := time.Since(lastStats)
@@ -528,17 +523,16 @@ func dropReplicationSlot(slot *string, sourceConfig pgx.ConnConfig) error {
 	return nil
 }
 
+func createTableRegex(str string) *regexp.Regexp {
+	tbl := strings.Replace(str, ".", "\\.", -1)
+	tbl = strings.Replace(tbl, "?", ".", -1)
+	tbl = strings.Replace(tbl, "*", ".*", -1)
+	tbl = strings.Replace(tbl, "$", "\\$", -1)
+	return regexp.MustCompile(tbl)
+}
+
 func (tl *tableList) Set(value string) error {
-	if len(*tl) > 0 {
-		return errors.New("tables flag already set")
-	}
-	for _, t := range strings.Split(value, ",") {
-		if !strings.Contains(t, ".") {
-			return fmt.Errorf("tables argument '%s' does not specify schema", t)
-		}
-		(*tl)[strings.TrimSpace(t)] = true
-		hasTables = true
-	}
+	*tl = append(*tl, createTableRegex(value))
 	return nil
 }
 
@@ -546,43 +540,76 @@ func (tl *tableList) String() string {
 	return fmt.Sprint(*tl)
 }
 
+func signalHandler() {
+	sig := <-sigs
+	logerrf("received signal: %s, shutting down", sig)
+
+	done.SetTo(true)
+
+	// non-blocking send to shutdown
+	select {
+	case shutdown <- true:
+	default:
+	}
+}
+
 func main() {
-	tables = make(tableList)
+	var err error
+	var sourceConfig pgx.ConnConfig
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, usage)
 	}
 
 	sourceURI := flag.String("source", "", "")
-	targetURI := flag.String("target", "", "")
 	create := flag.Bool("create", false, "")
 	drop := flag.Bool("drop", false, "")
-	slot := flag.String("slot", "", "")
-	flag.Var(&tables, "tables", "")
+	retryInitial := flag.Bool("retry-initial", false, "")
+	slot := flag.String("slot", "pg_kinesis", "")
+	stream := flag.String("stream", "", "")
+	flag.Var(&tables, "table", "-t")
+	flag.Var(&excludedTables, "excluded-table", "-T")
 
 	flag.Parse()
 
-	if (*sourceURI == "" || *targetURI == "" || *slot == "") ||
-		(*create && *drop) {
+	if *sourceURI != "" {
+		sourceConfig, err = pgx.ParseConnectionString(*sourceURI)
+
+		if err != nil {
+			logerror(errors.Wrapf(err, "unable to parse source DB URI '%s'", *sourceURI))
+			os.Exit(1)
+		}
+	} else {
+		logf("reading target DB configuration from shell environment")
+		sourceConfig, err = pgx.ParseEnvLibpq()
+
+		if err != nil {
+			logerror(errors.Wrapf(err, "unable to parse environment, and source not specified"))
+			fmt.Fprintf(os.Stderr, usage)
+			os.Exit(1)
+		}
+	}
+
+	if *slot == "" {
+		logerror(errors.New("blank slot; please specify slot with --slot"))
 		fmt.Fprintf(os.Stderr, usage)
 		os.Exit(1)
 	}
 
-	sourceConfig, err := pgx.ParseConnectionString(*sourceURI)
-	if err != nil {
-		logerror(errors.Wrapf(err, "unable to parse source DB URI '%s'", *sourceURI))
+	if *slot == "" {
+		logerror(errors.New("blank stream; please specify slot with --stream"))
+		fmt.Fprintf(os.Stderr, usage)
 		os.Exit(1)
 	}
 
-	targetConfig, err := pgx.ParseConnectionString(*targetURI)
-	if err != nil {
-		logerror(errors.Wrapf(err, "unable to parse target DB URI '%s'", *targetURI))
+	if *create && *drop {
+		logerror(errors.New("specify one of create or drop, not both"))
+		fmt.Fprintf(os.Stderr, usage)
 		os.Exit(1)
 	}
 
 	if *create {
 		logerror(createReplicationSlot(slot, sourceConfig))
-		os.Exit(0)
 	}
 
 	if *drop {
@@ -590,24 +617,21 @@ func main() {
 		os.Exit(0)
 	}
 
-	go func() {
-		sig := <-sigs
-		logerrf("received signal: %s, shutting down", sig)
+	kinesisClient = kinesis.New(session.New(aws.NewConfig()))
 
-		// non-blocking send to shutdown
-		select {
-		case shutdown <- true:
-		default:
-		}
+	tablesToStream = make(map[string]bool)
 
-		done.SetTo(true)
-	}()
-
+	go signalHandler()
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
 	for !done.IsSet() {
-		err := connectReplicateLoop(slot, sourceConfig, targetConfig)
+		err := connectReplicateLoop(slot, sourceConfig, stream)
 		logerror(err)
+
+		if !initiallyConnected && !*retryInitial {
+			logerrf("failed to connect initially, exiting; if you wish to retry on the initial connection (for a HA setup), set --retry-initial")
+			os.Exit(1)
+		}
 
 		if !done.IsSet() {
 			// non-blocking send to restart
@@ -616,7 +640,11 @@ func main() {
 			default:
 			}
 
-			time.Sleep(ReconnectInterval)
+			if initiallyConnected {
+				time.Sleep(ReconnectInterval)
+			} else {
+				time.Sleep(InitialReconnectInterval)
+			}
 		}
 	}
 }
