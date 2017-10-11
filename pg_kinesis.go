@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -84,6 +85,7 @@ var restart = make(chan bool, 1)
 var shutdown = make(chan bool, 1)
 var flush = make(chan bool, 1)
 var done = abool.New()
+var forceAck = abool.New()
 
 var walLock sync.Mutex
 var maxWal uint64
@@ -157,10 +159,10 @@ func flushRecords(stream *string) (bool, error) {
 			records = nil
 			return true, nil
 		}
-	}
 
-	if done.IsSet() {
-		return false, errors.New("interrupted PutRecords due to shutdown")
+		if done.IsSet() {
+			return false, errors.New("interrupted PutRecords due to shutdown")
+		}
 	}
 
 	return false, errors.New("failed to put records after many attempts")
@@ -193,27 +195,23 @@ func failures(records []*kinesis.PutRecordsRequestEntry,
 	return out
 }
 
-func marshalTypedNullString(tns *parselogical.TypedNullString) map[string]string {
-	if tns.Valid {
-		return map[string]string{"v": tns.String}
-	}
-
-	return map[string]string{"n": "true"}
+func marshalColumnValue(cv *parselogical.ColumnValue) map[string]string {
+	return map[string]string{"v": cv.String, "t": cv.Type, "q": strconv.FormatBool(cv.Quoted)}
 }
 
-func marshalTypedNullStringPair(newValue *parselogical.TypedNullString, oldValue *parselogical.TypedNullString) map[string]map[string]string {
+func marshalColumnValuePair(newValue *parselogical.ColumnValue, oldValue *parselogical.ColumnValue) map[string]map[string]string {
 	if oldValue != nil && newValue != nil {
 		return map[string]map[string]string{
-			"old": marshalTypedNullString(oldValue),
-			"cur": marshalTypedNullString(newValue),
+			"old": marshalColumnValue(oldValue),
+			"cur": marshalColumnValue(newValue),
 		}
 	} else if newValue != nil {
 		return map[string]map[string]string{
-			"cur": marshalTypedNullString(newValue),
+			"cur": marshalColumnValue(newValue),
 		}
 	} else if oldValue != nil {
 		return map[string]map[string]string{
-			"old": marshalTypedNullString(oldValue),
+			"old": marshalColumnValue(oldValue),
 		}
 	}
 
@@ -227,12 +225,12 @@ func marshalPTDToJSON(ptd *parselogical.ParsedTestDecoding) ([]byte, error) {
 		oldV, ok := ptd.OldFields[k]
 
 		if ptd.Operation == "DELETE" {
-			columns[k] = marshalTypedNullStringPair(nil, &v)
+			columns[k] = marshalColumnValuePair(nil, &v)
 		} else {
 			if ok && v.String != oldV.String {
-				columns[k] = marshalTypedNullStringPair(&v, &oldV)
+				columns[k] = marshalColumnValuePair(&v, &oldV)
 			} else {
-				columns[k] = marshalTypedNullStringPair(&v, nil)
+				columns[k] = marshalColumnValuePair(&v, nil)
 			}
 		}
 	}
@@ -310,17 +308,19 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 		return errors.Wrapf(err, "unable to parse columns of the replication message: %s", walString)
 	}
 
+	jsonRecord, err := marshalPTDToJSON(ptd)
+
 	if err != nil {
 		return errors.Wrap(err, "error serializing WAL record into JSON")
 	}
 
-	jsonRecord, err := marshalPTDToJSON(ptd)
-	lastMsg = msg
 	flushed, err := putRecord(jsonRecord, &ptd.SchemaTable, stream)
 
 	if err != nil {
 		return errors.Wrap(err, "unable to put record into Kinesis")
 	}
+
+	lastMsg = msg
 
 	if flushed {
 		ack(msg)
@@ -366,10 +366,9 @@ func ack(msg *pgx.ReplicationMessage) {
 	walLock.Lock()
 	defer walLock.Unlock()
 
-	// todo: persist into dynamodb
-
 	if msg.WalMessage.WalStart > maxWal {
 		maxWal = msg.WalMessage.WalStart
+		forceAck.SetTo(true)
 	}
 }
 
@@ -377,7 +376,7 @@ func sendKeepalive(conn *pgx.ReplicationConn, force bool) error {
 	walLock.Lock()
 	defer walLock.Unlock()
 
-	if force || time.Since(lastStatus) >= DefaultKeepaliveTimeout || maxWal > maxWalSent {
+	if force || forceAck.IsSet() || time.Since(lastStatus) >= DefaultKeepaliveTimeout || maxWal > maxWalSent {
 		status, err := pgx.NewStandbyStatus(maxWal)
 		if err != nil {
 			return err
@@ -390,6 +389,7 @@ func sendKeepalive(conn *pgx.ReplicationConn, force bool) error {
 
 		lastStatus = time.Now()
 		maxWalSent = maxWal
+		forceAck.SetTo(false)
 	}
 
 	return nil
