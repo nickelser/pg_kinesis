@@ -415,6 +415,8 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 		return errors.Wrapf(err, "unable to start replication to slot %s", *slot)
 	}
 
+	kinesisClient = kinesis.New(session.New(aws.NewConfig()))
+
 	lastStatus = time.Now()
 	initiallyConnected = true
 
@@ -621,8 +623,6 @@ func main() {
 		logerror(dropReplicationSlot(slot, sourceConfig))
 		os.Exit(0)
 	}
-
-	kinesisClient = kinesis.New(session.New(aws.NewConfig()))
 
 	tablesToStream = make(map[string]bool)
 
