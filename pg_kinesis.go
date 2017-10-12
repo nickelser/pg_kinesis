@@ -218,7 +218,7 @@ func marshalColumnValuePair(newValue *parselogical.ColumnValue, oldValue *parsel
 	return nil
 }
 
-func marshalPTDToJSON(ptd *parselogical.ParsedTestDecoding) ([]byte, error) {
+func marshalWALToJSON(ptd *parselogical.ParsedTestDecoding, msg *pgx.ReplicationMessage) ([]byte, error) {
 	columns := make(map[string]map[string]map[string]string)
 
 	for k, v := range ptd.Fields {
@@ -235,11 +235,15 @@ func marshalPTDToJSON(ptd *parselogical.ParsedTestDecoding) ([]byte, error) {
 		}
 	}
 
+	lsn := pgx.FormatLSN(msg.WalMessage.WalStart)
+
 	return json.Marshal(struct {
+		Lsn       *string                                  `json:"lsn"`
 		Table     *string                                  `json:"table"`
 		Operation *string                                  `json:"operation"`
 		Columns   *map[string]map[string]map[string]string `json:"columns"`
 	}{
+		Lsn:       &lsn,
 		Table:     &ptd.SchemaTable,
 		Operation: &ptd.Operation,
 		Columns:   &columns,
@@ -308,7 +312,7 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 		return errors.Wrapf(err, "unable to parse columns of the replication message: %s", walString)
 	}
 
-	jsonRecord, err := marshalPTDToJSON(ptd)
+	jsonRecord, err := marshalWALToJSON(ptd, msg)
 
 	if err != nil {
 		return errors.Wrap(err, "error serializing WAL record into JSON")
