@@ -149,6 +149,7 @@ func flushRecords(stream *string) (bool, error) {
 
 		if err != nil {
 			logerror(errors.Wrapf(err, "kinesis PutRecords failed; retrying failed records in %s", retryDuration.String()))
+			kinesisClient = kinesis.New(session.New(aws.NewConfig())) // refresh the client to get new credentials etc.
 			time.Sleep(retryDuration)
 		} else if *out.FailedRecordCount > 0 {
 			logerrf("%d records failed during Kinesis PutRecords; retrying in %s", *out.FailedRecordCount, retryDuration.String())
