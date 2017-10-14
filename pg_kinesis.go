@@ -481,7 +481,7 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 			stats.Lock()
 			timePerInsert := float64(0)
 			if float64(stats.putRecordsTime) > 0 {
-				timePerInsert = float64(stats.putRecords) / (float64(stats.putRecordsTime) / float64(time.Millisecond))
+				timePerInsert = (float64(stats.putRecordsTime) / float64(time.Millisecond)) / float64(stats.putRecords)
 			}
 			logf("inserts=%d (%.1f/s) updates=%d (%.1f/s) deletes=%d (%.1f/s) skipped=%d (%.1f/s) putrecords=%d (%.1f/s, %.0fms/record, %.1fs total) lsn=%s",
 				stats.inserts, float64(stats.inserts)/sinceLastStats.Seconds(),
