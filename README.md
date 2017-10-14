@@ -49,19 +49,19 @@ UPDATE customers SET last_name = 'Replica Friends' where first_name = 'Hello';
 # "lsn" is the WAL location of the operation
 # "table" is the <schema>.<table> of the operation
 # "operation" is the SQL operation that was performed
-# "columns" is a mapping of the column name to "cur" and optionally "old" (the current and the previous value, respectively)
+# "columns" is a mapping of the column name to a "new" value and optionally an "old" value (the current and the previous value, for an update or delete)
 # each column value under "cur" or "old" has three fields:
-#   "q" is if the value was quoted or not (false for null or (no-tuple-data))
+#   "q" is if the value was quoted from postgres or not (false for simple values, like integers or booleans, null or (no-tuple-data))
 #   "t" is the postgres type of the value
 #   "v" is the string value
-{"lsn":"1C/B01D63D8","table":"public.customers","operation":"INSERT","columns":{"first_name":{"cur":{"q":"true","t":"text","v":"Hello"}},"id":{"cur":{"q":"false","t":"integer","v":"1"}},"last_name":{"cur":{"q":"true","t":"text","v":"World"}}}}
-{"lsn":"1C/B01D64E0","table":"public.customers","operation":"INSERT","columns":{"first_name":{"cur":{"q":"true","t":"text","v":"Goodbye"}},"id":{"cur":{"q":"false","t":"integer","v":"2"}},"last_name":{"cur":{"q":"true","t":"text","v":"World"}}}}
-{"lsn":"1C/B01D65D8","table":"public.customers","operation":"UPDATE","columns":{"first_name":{"cur":{"q":"true","t":"text","v":"Hello"}},"id":{"cur":{"q":"false","t":"integer","v":"1"}},"last_name":{"cur":{"q":"true","t":"text","v":"Friends"}}}}
-{"lsn":"1C/B01D6698","table":"public.customers","operation":"DELETE","columns":{"id":{"old":{"q":"false","t":"integer","v":"2"}}}}
+{"lsn":"1C/BB48DBF0","table":"public.customers","operation":"INSERT","columns":{"first_name":{"new":{"q":"true","t":"text","v":"Hello"}},"id":{"new":{"q":"false","t":"integer","v":"1"}},"last_name":{"new":{"q":"true","t":"text","v":"World"}}}}
+{"lsn":"1C/BB48DCF8","table":"public.customers","operation":"INSERT","columns":{"first_name":{"new":{"q":"true","t":"text","v":"Goodbye"}},"id":{"new":{"q":"false","t":"integer","v":"2"}},"last_name":{"new":{"q":"true","t":"text","v":"World"}}}}
+{"lsn":"1C/BB48DDB8","table":"public.customers","operation":"UPDATE","columns":{"first_name":{"new":{"q":"true","t":"text","v":"Hello"}},"id":{"new":{"q":"false","t":"integer","v":"1"}},"last_name":{"new":{"q":"true","t":"text","v":"Friends"}}}}
+{"lsn":"1C/BB48DE78","table":"public.customers","operation":"DELETE","columns":{"id":{"old":{"q":"false","t":"integer","v":"2"}}}}
 
 # With REPLICA IDENTITY FULL
 # (notice the added "old" field)
-{"lsn":"1C/B01DF8F8","table":"public.customers","operation":"UPDATE","columns":{"first_name":{"cur":{"q":"true","t":"text","v":"Hello"}},"id":{"cur":{"q":"false","t":"integer","v":"1"}},"last_name":{"cur":{"q":"true","t":"text","v":"Replica Friends"},"old":{"q":"true","t":"text","v":"Friends"}}}}
+{"lsn":"1C/BB48E068","table":"public.customers","operation":"UPDATE","columns":{"first_name":{"new":{"q":"true","t":"text","v":"Hello"}},"id":{"new":{"q":"false","t":"integer","v":"1"}},"last_name":{"new":{"q":"true","t":"text","v":"Replica Friends"},"old":{"q":"true","t":"text","v":"Friends"}}}}
 ```
 
 ## Contributing

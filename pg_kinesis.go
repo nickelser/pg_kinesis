@@ -200,18 +200,18 @@ func failures(records []*kinesis.PutRecordsRequestEntry,
 }
 
 func marshalColumnValue(cv *parselogical.ColumnValue) map[string]string {
-	return map[string]string{"v": cv.String, "t": cv.Type, "q": strconv.FormatBool(cv.Quoted)}
+	return map[string]string{"v": cv.Value, "t": cv.Type, "q": strconv.FormatBool(cv.Quoted)}
 }
 
 func marshalColumnValuePair(newValue *parselogical.ColumnValue, oldValue *parselogical.ColumnValue) map[string]map[string]string {
 	if oldValue != nil && newValue != nil {
 		return map[string]map[string]string{
 			"old": marshalColumnValue(oldValue),
-			"cur": marshalColumnValue(newValue),
+			"new": marshalColumnValue(newValue),
 		}
 	} else if newValue != nil {
 		return map[string]map[string]string{
-			"cur": marshalColumnValue(newValue),
+			"new": marshalColumnValue(newValue),
 		}
 	} else if oldValue != nil {
 		return map[string]map[string]string{
@@ -231,7 +231,7 @@ func marshalWALToJSON(pr *parselogical.ParseResult, msg *pgx.ReplicationMessage)
 		if pr.Operation == "DELETE" {
 			columns[k] = marshalColumnValuePair(nil, &v)
 		} else {
-			if ok && v.String != oldV.String {
+			if ok && v.Value != oldV.Value {
 				columns[k] = marshalColumnValuePair(&v, &oldV)
 			} else {
 				columns[k] = marshalColumnValuePair(&v, nil)
