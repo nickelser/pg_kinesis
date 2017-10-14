@@ -266,7 +266,7 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 	}
 
 	if pr.Operation == "BEGIN" || pr.Operation == "COMMIT" {
-		ack(msg)
+		ack(msg, false)
 		return nil
 	}
 
@@ -297,7 +297,7 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 
 	if !include {
 		stats.skipped++
-		ack(msg)
+		ack(msg, false)
 		return nil
 	}
 
@@ -331,7 +331,7 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 	lastMsg = msg
 
 	if flushed {
-		ack(msg)
+		ack(msg, true)
 	}
 
 	return nil
@@ -357,7 +357,7 @@ func replicationLoop(replicationMessages chan *pgx.ReplicationMessage, replicati
 			}
 
 			if flushed {
-				ack(lastMsg)
+				ack(lastMsg, true)
 			}
 		case msg = <-replicationMessages:
 			err := handleReplicationMsg(msg, stream)
@@ -370,13 +370,15 @@ func replicationLoop(replicationMessages chan *pgx.ReplicationMessage, replicati
 	}
 }
 
-func ack(msg *pgx.ReplicationMessage) {
+func ack(msg *pgx.ReplicationMessage, force bool) {
 	walLock.Lock()
 	defer walLock.Unlock()
 
 	if msg.WalMessage.WalStart > maxWal {
 		maxWal = msg.WalMessage.WalStart
-		forceAck.SetTo(true)
+		if force {
+			forceAck.SetTo(true)
+		}
 	}
 }
 
