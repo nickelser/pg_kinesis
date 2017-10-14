@@ -74,10 +74,12 @@ const (
 var stats struct {
 	sync.Mutex
 
-	updates uint64
-	inserts uint64
-	deletes uint64
-	skipped uint64
+	updates        uint64
+	inserts        uint64
+	deletes        uint64
+	skipped        uint64
+	putRecords     uint64
+	putRecordsTime time.Duration
 }
 
 var sigs = make(chan os.Signal, 1)
@@ -156,7 +158,8 @@ func flushRecords(stream *string) (bool, error) {
 			records = failures(records, out.Records)
 			time.Sleep(retryDuration)
 		} else if *out.FailedRecordCount == 0 {
-			logf("put %d records to Kinesis in %s", len(records), elapsed)
+			stats.putRecords += uint64(len(records))
+			stats.putRecordsTime += elapsed
 			records = nil
 			return true, nil
 		}
@@ -219,13 +222,13 @@ func marshalColumnValuePair(newValue *parselogical.ColumnValue, oldValue *parsel
 	return nil
 }
 
-func marshalWALToJSON(ptd *parselogical.ParsedTestDecoding, msg *pgx.ReplicationMessage) ([]byte, error) {
+func marshalWALToJSON(pr *parselogical.ParseResult, msg *pgx.ReplicationMessage) ([]byte, error) {
 	columns := make(map[string]map[string]map[string]string)
 
-	for k, v := range ptd.Fields {
-		oldV, ok := ptd.OldFields[k]
+	for k, v := range pr.Columns {
+		oldV, ok := pr.OldColumns[k]
 
-		if ptd.Operation == "DELETE" {
+		if pr.Operation == "DELETE" {
 			columns[k] = marshalColumnValuePair(nil, &v)
 		} else {
 			if ok && v.String != oldV.String {
@@ -245,8 +248,8 @@ func marshalWALToJSON(ptd *parselogical.ParsedTestDecoding, msg *pgx.Replication
 		Columns   *map[string]map[string]map[string]string `json:"columns"`
 	}{
 		Lsn:       &lsn,
-		Table:     &ptd.SchemaTable,
-		Operation: &ptd.Operation,
+		Table:     &pr.Relation,
+		Operation: &pr.Operation,
 		Columns:   &columns,
 	})
 }
@@ -255,14 +258,14 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 	var err error
 
 	walString := string(msg.WalMessage.WalData)
-	ptd := parselogical.NewParsedTestDecoding(walString)
-	err = ptd.ParsePrelude()
+	pr := parselogical.NewParseResult(walString)
+	err = pr.ParsePrelude()
 
 	if err != nil {
 		return errors.Wrapf(err, "unable to parse table or operation type of replication message: %s", walString)
 	}
 
-	if ptd.Transaction != "" {
+	if pr.Operation == "BEGIN" || pr.Operation == "COMMIT" {
 		ack(msg)
 		return nil
 	}
@@ -270,26 +273,26 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 	stats.Lock()
 	defer stats.Unlock()
 
-	include, ok := tablesToStream[ptd.SchemaTable]
+	include, ok := tablesToStream[pr.Relation]
 
 	if !ok {
 		include = len(tables) == 0
 
 		for _, tblRegex := range tables {
-			if tblRegex.MatchString(ptd.SchemaTable) {
+			if tblRegex.MatchString(pr.Relation) {
 				include = true
 				break
 			}
 		}
 
 		for _, tblRegex := range excludedTables {
-			if tblRegex.MatchString(ptd.SchemaTable) {
+			if tblRegex.MatchString(pr.Relation) {
 				include = false
 				break
 			}
 		}
 
-		tablesToStream[ptd.SchemaTable] = include
+		tablesToStream[pr.Relation] = include
 	}
 
 	if !include {
@@ -298,7 +301,7 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 		return nil
 	}
 
-	switch ptd.Operation {
+	switch pr.Operation {
 	case "UPDATE":
 		stats.updates++
 	case "INSERT":
@@ -307,19 +310,19 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 		stats.deletes++
 	}
 
-	err = ptd.ParseColumns()
+	err = pr.ParseColumns()
 
 	if err != nil {
 		return errors.Wrapf(err, "unable to parse columns of the replication message: %s", walString)
 	}
 
-	jsonRecord, err := marshalWALToJSON(ptd, msg)
+	jsonRecord, err := marshalWALToJSON(pr, msg)
 
 	if err != nil {
 		return errors.Wrap(err, "error serializing WAL record into JSON")
 	}
 
-	flushed, err := putRecord(jsonRecord, &ptd.SchemaTable, stream)
+	flushed, err := putRecord(jsonRecord, &pr.Relation, stream)
 
 	if err != nil {
 		return errors.Wrap(err, "unable to put record into Kinesis")
@@ -476,16 +479,23 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 		sinceLastStats := time.Since(lastStats)
 		if sinceLastStats >= StatsInterval {
 			stats.Lock()
-			logf("stats: inserts %d (%.1f/s), updates %d (%.1f/s), deletes %d (%.1f/s), skipped %d (%.1f/s), confirmed LSN %s",
+			timePerInsert := float64(0)
+			if float64(stats.putRecordsTime) > 0 {
+				timePerInsert = float64(stats.putRecords) / (float64(stats.putRecordsTime) / float64(time.Millisecond))
+			}
+			logf("inserts=%d (%.1f/s) updates=%d (%.1f/s) deletes=%d (%.1f/s) skipped=%d (%.1f/s) putrecords=%d (%.1f/s, %.0fms/record, %.1fs total) lsn=%s",
 				stats.inserts, float64(stats.inserts)/sinceLastStats.Seconds(),
 				stats.updates, float64(stats.updates)/sinceLastStats.Seconds(),
 				stats.deletes, float64(stats.deletes)/sinceLastStats.Seconds(),
 				stats.skipped, float64(stats.skipped)/sinceLastStats.Seconds(),
+				stats.putRecords, float64(stats.putRecords)/sinceLastStats.Seconds(), timePerInsert, float64(stats.putRecordsTime)/float64(time.Second),
 				pgx.FormatLSN(maxWalSent))
 			stats.inserts = 0
 			stats.updates = 0
 			stats.deletes = 0
 			stats.skipped = 0
+			stats.putRecords = 0
+			stats.putRecordsTime = 0
 			stats.Unlock()
 			lastStats = time.Now()
 		}
