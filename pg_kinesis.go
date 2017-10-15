@@ -586,8 +586,10 @@ func main() {
 	retryInitial := flag.Bool("retry-initial", false, "")
 	slot := flag.String("slot", "pg_kinesis", "")
 	stream := flag.String("stream", "", "")
-	flag.Var(&tables, "table", "-t")
-	flag.Var(&excludedTables, "excluded-table", "-T")
+	flag.Var(&tables, "table", "")
+	flag.Var(&tables, "t", "")
+	flag.Var(&excludedTables, "exclude-table", "")
+	flag.Var(&excludedTables, "T", "")
 
 	flag.Parse()
 
