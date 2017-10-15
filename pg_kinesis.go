@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -71,14 +72,12 @@ const (
 )
 
 var stats struct {
-	sync.Mutex
-
 	updates        uint64
 	inserts        uint64
 	deletes        uint64
 	skipped        uint64
 	putRecords     uint64
-	putRecordsTime time.Duration
+	putRecordsTime uint64
 }
 
 var sigs = make(chan os.Signal, 1)
@@ -155,13 +154,13 @@ func flushRecords(stream *string) (bool, error) {
 		} else if *out.FailedRecordCount > 0 {
 			logerrf("%d records failed during Kinesis PutRecords; retrying in %s", *out.FailedRecordCount, retryDuration.String())
 			originalRecordsCount := uint64(len(records))
-			stats.putRecordsTime += elapsed
+			atomic.AddUint64(&stats.putRecordsTime, uint64(elapsed))
 			records = failures(records, out.Records)
-			stats.putRecords += originalRecordsCount - uint64(len(records)) // total - unsent = sent
+			atomic.AddUint64(&stats.putRecords, originalRecordsCount-uint64(len(records))) // total - unsent = sent
 			time.Sleep(retryDuration)
 		} else if *out.FailedRecordCount == 0 {
-			stats.putRecords += uint64(len(records))
-			stats.putRecordsTime += elapsed
+			atomic.AddUint64(&stats.putRecordsTime, uint64(elapsed))
+			atomic.AddUint64(&stats.putRecords, uint64(len(records)))
 			records = nil
 			return true, nil
 		}
@@ -271,9 +270,6 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 		return nil
 	}
 
-	stats.Lock()
-	defer stats.Unlock()
-
 	include, ok := tablesToStream[pr.Relation]
 
 	if !ok {
@@ -297,17 +293,17 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 	}
 
 	if !include {
-		stats.skipped++
+		atomic.AddUint64(&stats.skipped, 1)
 		return nil
 	}
 
 	switch pr.Operation {
 	case "UPDATE":
-		stats.updates++
+		atomic.AddUint64(&stats.updates, 1)
 	case "INSERT":
-		stats.inserts++
+		atomic.AddUint64(&stats.inserts, 1)
 	case "DELETE":
-		stats.deletes++
+		atomic.AddUint64(&stats.deletes, 1)
 	}
 
 	err = pr.ParseColumns()
@@ -482,26 +478,30 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 
 		sinceLastStats := time.Since(lastStats)
 		if sinceLastStats >= StatsInterval {
-			stats.Lock()
+			lastStats = time.Now()
 			timePerInsert := float64(0)
-			if float64(stats.putRecordsTime) > 0 {
-				timePerInsert = (float64(stats.putRecordsTime) / float64(time.Millisecond)) / float64(stats.putRecords)
+			putRecordsTime := atomic.LoadUint64(&stats.putRecordsTime)
+			putRecords := atomic.LoadUint64(&stats.putRecords)
+			inserts := atomic.LoadUint64(&stats.inserts)
+			updates := atomic.LoadUint64(&stats.updates)
+			deletes := atomic.LoadUint64(&stats.deletes)
+			skipped := atomic.LoadUint64(&stats.skipped)
+			if time.Duration(putRecordsTime) > 0 {
+				timePerInsert = (float64(putRecordsTime) / float64(time.Millisecond)) / float64(putRecords)
 			}
 			logf("inserts=%d (%.1f/s) updates=%d (%.1f/s) deletes=%d (%.1f/s) skipped=%d (%.1f/s) putrecords=%d (%.1f/s, %.0fms/record, %.1fs total) lsn=%s",
-				stats.inserts, float64(stats.inserts)/sinceLastStats.Seconds(),
-				stats.updates, float64(stats.updates)/sinceLastStats.Seconds(),
-				stats.deletes, float64(stats.deletes)/sinceLastStats.Seconds(),
-				stats.skipped, float64(stats.skipped)/sinceLastStats.Seconds(),
-				stats.putRecords, float64(stats.putRecords)/sinceLastStats.Seconds(), timePerInsert, float64(stats.putRecordsTime)/float64(time.Second),
+				inserts, float64(inserts)/sinceLastStats.Seconds(),
+				updates, float64(updates)/sinceLastStats.Seconds(),
+				deletes, float64(deletes)/sinceLastStats.Seconds(),
+				skipped, float64(skipped)/sinceLastStats.Seconds(),
+				putRecords, float64(putRecords)/sinceLastStats.Seconds(), timePerInsert, float64(putRecordsTime)/float64(time.Second),
 				pgx.FormatLSN(maxWalSent))
-			stats.inserts = 0
-			stats.updates = 0
-			stats.deletes = 0
-			stats.skipped = 0
-			stats.putRecords = 0
-			stats.putRecordsTime = 0
-			stats.Unlock()
-			lastStats = time.Now()
+			atomic.StoreUint64(&stats.inserts, 0)
+			atomic.StoreUint64(&stats.updates, 0)
+			atomic.StoreUint64(&stats.deletes, 0)
+			atomic.StoreUint64(&stats.skipped, 0)
+			atomic.StoreUint64(&stats.putRecords, 0)
+			atomic.StoreUint64(&stats.putRecordsTime, 0)
 		}
 	}
 
