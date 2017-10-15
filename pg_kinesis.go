@@ -8,7 +8,6 @@ import (
 	"os/signal"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -29,7 +28,7 @@ import (
 	"github.com/tevino/abool"
 )
 
-const version string = "v0.1.0"
+const version string = "v0.5.0"
 const usage string = `pg_kinesis: replicate output from Postgres' test_decoder plugin to AWS Kinesis
 
 Usage:
@@ -201,7 +200,11 @@ func failures(records []*kinesis.PutRecordsRequestEntry,
 }
 
 func marshalColumnValue(cv *parselogical.ColumnValue) map[string]string {
-	return map[string]string{"v": cv.Value, "t": cv.Type, "q": strconv.FormatBool(cv.Quoted)}
+	quoted := "false"
+	if cv.Quoted {
+		quoted = "true"
+	}
+	return map[string]string{"v": cv.Value, "t": cv.Type, "q": quoted}
 }
 
 func marshalColumnValuePair(newValue *parselogical.ColumnValue, oldValue *parselogical.ColumnValue) map[string]map[string]string {
