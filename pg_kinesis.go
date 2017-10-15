@@ -65,10 +65,9 @@ const StatsInterval = 10 * time.Second
 const FlushInterval = 1 * time.Second
 
 const (
-	maxRecordSize         = 1 << 20 // 1MiB
-	maxRequestSize        = 5 << 20 // 5MiB
-	maxRecordsPerRequest  = 500
-	defaultMaxConnections = 24
+	maxRecordSize        = 1 << 20 // 1MiB
+	maxRequestSize       = 5 << 20 // 5MiB
+	maxRecordsPerRequest = 500
 )
 
 var stats struct {
@@ -155,7 +154,10 @@ func flushRecords(stream *string) (bool, error) {
 			time.Sleep(retryDuration)
 		} else if *out.FailedRecordCount > 0 {
 			logerrf("%d records failed during Kinesis PutRecords; retrying in %s", *out.FailedRecordCount, retryDuration.String())
+			originalRecordsCount := uint64(len(records))
+			stats.putRecordsTime += elapsed
 			records = failures(records, out.Records)
+			stats.putRecords += originalRecordsCount - uint64(len(records)) // total - unsent = sent
 			time.Sleep(retryDuration)
 		} else if *out.FailedRecordCount == 0 {
 			stats.putRecords += uint64(len(records))
@@ -266,7 +268,6 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 	}
 
 	if pr.Operation == "BEGIN" || pr.Operation == "COMMIT" {
-		ack(msg, false)
 		return nil
 	}
 
@@ -297,7 +298,6 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 
 	if !include {
 		stats.skipped++
-		ack(msg, false)
 		return nil
 	}
 
@@ -331,7 +331,7 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 	lastMsg = msg
 
 	if flushed {
-		ack(msg, true)
+		ack(msg)
 	}
 
 	return nil
@@ -357,7 +357,7 @@ func replicationLoop(replicationMessages chan *pgx.ReplicationMessage, replicati
 			}
 
 			if flushed {
-				ack(lastMsg, true)
+				ack(lastMsg)
 			}
 		case msg = <-replicationMessages:
 			err := handleReplicationMsg(msg, stream)
@@ -370,15 +370,13 @@ func replicationLoop(replicationMessages chan *pgx.ReplicationMessage, replicati
 	}
 }
 
-func ack(msg *pgx.ReplicationMessage, force bool) {
+func ack(msg *pgx.ReplicationMessage) {
 	walLock.Lock()
 	defer walLock.Unlock()
 
 	if msg.WalMessage.WalStart > maxWal {
 		maxWal = msg.WalMessage.WalStart
-		if force {
-			forceAck.SetTo(true)
-		}
+		forceAck.SetTo(true)
 	}
 }
 
@@ -474,8 +472,12 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 		sinceLastFlush := time.Since(lastFlush)
 
 		if sinceLastFlush >= FlushInterval {
-			flush <- true
-			lastFlush = time.Now()
+			// non-blocking send to flush
+			select {
+			case flush <- true:
+				lastFlush = time.Now()
+			default: // already has a flush queued up, so don't block
+			}
 		}
 
 		sinceLastStats := time.Since(lastStats)
@@ -502,10 +504,6 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 			lastStats = time.Now()
 		}
 	}
-
-	// if we are closing down, send a last keepalive before closing the connection
-	// we can ignore the error safely
-	sendKeepalive(conn, true)
 
 	return nil
 }
