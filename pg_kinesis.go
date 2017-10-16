@@ -90,6 +90,7 @@ var forceAck = abool.New()
 
 var walLock sync.Mutex
 var maxWal uint64
+var latestKinesisSequenceNumber string
 var maxWalSent uint64
 var lastStatus time.Time
 var lastFlush time.Time
@@ -161,6 +162,9 @@ func flushRecords(stream *string) (bool, error) {
 		} else if *out.FailedRecordCount == 0 {
 			atomic.AddUint64(&stats.putRecordsTime, uint64(elapsed))
 			atomic.AddUint64(&stats.putRecords, uint64(len(records)))
+			if len(out.Records) > 0 {
+				latestKinesisSequenceNumber = *out.Records[len(out.Records)-1].SequenceNumber
+			}
 			records = nil
 			return true, nil
 		}
@@ -245,13 +249,16 @@ func marshalWALToJSON(pr *parselogical.ParseResult, msg *pgx.ReplicationMessage)
 	}
 
 	lsn := pgx.FormatLSN(msg.WalMessage.WalStart)
+	time := time.Unix(0, int64(msg.WalMessage.ServerTime)).Format(time.RFC3339)
 
 	return json.Marshal(struct {
+		Time      *string                                  `json:"time"`
 		Lsn       *string                                  `json:"lsn"`
 		Table     *string                                  `json:"table"`
 		Operation *string                                  `json:"operation"`
 		Columns   *map[string]map[string]map[string]string `json:"columns"`
 	}{
+		Time:      &time,
 		Lsn:       &lsn,
 		Table:     &pr.Relation,
 		Operation: &pr.Operation,
@@ -371,21 +378,19 @@ func replicationLoop(replicationMessages chan *pgx.ReplicationMessage, replicati
 }
 
 func ack(msg *pgx.ReplicationMessage) {
-	walLock.Lock()
-	defer walLock.Unlock()
+	curMaxWal := atomic.LoadUint64(&maxWal)
 
-	if msg.WalMessage.WalStart > maxWal {
-		maxWal = msg.WalMessage.WalStart
+	if curMaxWal < msg.WalMessage.WalStart {
+		atomic.StoreUint64(&maxWal, msg.WalMessage.WalStart)
 		forceAck.SetTo(true)
 	}
 }
 
 func sendKeepalive(conn *pgx.ReplicationConn, force bool) error {
-	walLock.Lock()
-	defer walLock.Unlock()
+	curMaxWal := atomic.LoadUint64(&maxWal)
 
-	if force || forceAck.IsSet() || time.Since(lastStatus) >= DefaultKeepaliveTimeout || maxWal > maxWalSent {
-		status, err := pgx.NewStandbyStatus(maxWal)
+	if force || forceAck.IsSet() || time.Since(lastStatus) >= DefaultKeepaliveTimeout || curMaxWal > maxWalSent {
+		status, err := pgx.NewStandbyStatus(curMaxWal)
 		if err != nil {
 			return err
 		}
@@ -396,7 +401,7 @@ func sendKeepalive(conn *pgx.ReplicationConn, force bool) error {
 		}
 
 		lastStatus = time.Now()
-		maxWalSent = maxWal
+		maxWalSent = curMaxWal
 		forceAck.SetTo(false)
 	}
 
@@ -440,6 +445,7 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 		replicationCtx, cancelFn := context.WithTimeout(context.Background(), ReplicationLoopInterval)
 		message, err = conn.WaitForReplicationMessage(replicationCtx)
 		cancelFn()
+		now := time.Now()
 
 		if err != nil && err != context.DeadlineExceeded {
 			return errors.Wrap(err, "waiting for replication message failed")
@@ -458,6 +464,9 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 
 		if message != nil {
 			if message.WalMessage != nil {
+				// this is not exactly the server time
+				// but we are taking over this field as PG does not send it down
+				message.WalMessage.ServerTime = uint64(now.UnixNano())
 				replicationMessages <- message
 			} else if message.ServerHeartbeat != nil {
 				keepaliveRequested = message.ServerHeartbeat.ReplyRequested == 1
@@ -493,13 +502,14 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 			if time.Duration(putRecordsTime) > 0 {
 				timePerInsert = (float64(putRecordsTime) / float64(time.Millisecond)) / float64(putRecords)
 			}
-			logf("inserts=%d (%.1f/s) updates=%d (%.1f/s) deletes=%d (%.1f/s) skipped=%d (%.1f/s) putrecords=%d (%.1f/s, %.0fms/record, %.1fs total) lsn=%s",
+			logf("inserts=%d (%.1f/s) updates=%d (%.1f/s) deletes=%d (%.1f/s) skipped=%d (%.1f/s) putrecords=%d (%.1f/s, %.0fms/record, %.1fs total) lsn=%s seq=%s",
 				inserts, float64(inserts)/sinceLastStats.Seconds(),
 				updates, float64(updates)/sinceLastStats.Seconds(),
 				deletes, float64(deletes)/sinceLastStats.Seconds(),
 				skipped, float64(skipped)/sinceLastStats.Seconds(),
 				putRecords, float64(putRecords)/sinceLastStats.Seconds(), timePerInsert, float64(putRecordsTime)/float64(time.Second),
-				pgx.FormatLSN(maxWalSent))
+				pgx.FormatLSN(maxWalSent),
+				latestKinesisSequenceNumber)
 			atomic.StoreUint64(&stats.inserts, 0)
 			atomic.StoreUint64(&stats.updates, 0)
 			atomic.StoreUint64(&stats.deletes, 0)
