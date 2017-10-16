@@ -431,7 +431,7 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 
 	go replicationLoop(replicationMessages, replicationFinished, stream)
 
-	logf("replication starting from LSN %s", lastStatus, pgx.FormatLSN(maxWalSent))
+	logf("replication starting from LSN %s", pgx.FormatLSN(maxWalSent))
 
 	for !done.IsSet() {
 		var message *pgx.ReplicationMessage
