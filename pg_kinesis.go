@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -28,7 +29,7 @@ import (
 	"github.com/tevino/abool"
 )
 
-const version string = "v0.5.0"
+const version string = "v0.6.0"
 const usage string = `pg_kinesis: replicate output from Postgres' test_decoder plugin to AWS Kinesis
 
 Usage:
@@ -44,6 +45,7 @@ Options:
   -t --table            Table to transfer. Multiple tables can be selected by writing multiple -t switches. Defaults to all tables. The matching semantics are the same as psql (https://www.postgresql.org/docs/current/static/app-psql.html#app-psql-patterns)
   -T --exclude-table    Table to exclude. Defaults to excluding no tables. The matching logic is the same as for -t; -T has higher precedence than -t.
   --retry-initial       If this flag is present, retry the initial connection to the replication slot; useful for high-availability setups where the same pg_kinesis command is run from multiple hosts.
+  --version             Display the current pg_kinesis version and exit.
 `
 
 // DefaultKeepaliveTimeout is the time before we proactively send a keepalive & status update
@@ -114,8 +116,7 @@ func logerror(err error) {
 }
 
 func logf(format string, a ...interface{}) {
-	_, file, line, _ := runtime.Caller(1)
-	fmt.Fprintln(os.Stdout, file, ":", line, " ", fmt.Sprintf(format, a...))
+	fmt.Fprintln(os.Stdout, time.Now().Format(time.RFC3339), fmt.Sprintf(format, a...))
 }
 
 func logerrf(format string, a ...interface{}) {
@@ -430,18 +431,18 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 
 	go replicationLoop(replicationMessages, replicationFinished, stream)
 
-	logf("replication started at %v starting from LSN %s", lastStatus, pgx.FormatLSN(maxWalSent))
+	logf("replication starting from LSN %s", lastStatus, pgx.FormatLSN(maxWalSent))
 
 	for !done.IsSet() {
 		var message *pgx.ReplicationMessage
 		keepaliveRequested := false
 
-		message, err = conn.WaitForReplicationMessage(ReplicationLoopInterval)
+		replicationCtx, cancelFn := context.WithTimeout(context.Background(), ReplicationLoopInterval)
+		message, err = conn.WaitForReplicationMessage(replicationCtx)
+		cancelFn()
 
-		if err != nil {
-			if err != pgx.ErrNotificationTimeout {
-				return errors.Wrap(err, "waiting for replication message failed")
-			}
+		if err != nil && err != context.DeadlineExceeded {
+			return errors.Wrap(err, "waiting for replication message failed")
 		}
 
 		// check if the replicating goroutine died
@@ -592,7 +593,14 @@ func main() {
 	flag.Var(&excludedTables, "exclude-table", "")
 	flag.Var(&excludedTables, "T", "")
 
+	showVersion := flag.Bool("version", false, "")
+
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("pg_kinesis %s\n", version)
+		os.Exit(0)
+	}
 
 	if *sourceURI != "" {
 		sourceConfig, err = pgx.ParseConnectionString(*sourceURI)
