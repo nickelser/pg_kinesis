@@ -72,6 +72,9 @@ const (
 	maxRecordsPerRequest = 500
 )
 
+const maxSenders = 24
+const maxBacklog = 48
+
 var stats struct {
 	updates        uint64
 	inserts        uint64
@@ -81,12 +84,24 @@ var stats struct {
 	putRecordsTime uint64
 }
 
+type putRecordEntry struct {
+	stream *string
+	msg    *pgx.WalMessage
+	pr     *parselogical.ParseResult
+	skip   bool
+	json   []byte
+}
+
 var sigs = make(chan os.Signal, 1)
 var restart = make(chan bool, 1)
 var shutdown = make(chan bool, 1)
 var flush = make(chan bool, 1)
 var done = abool.New()
-var forceAck = abool.New()
+
+var messagesToStream map[int]chan *putRecordEntry
+var tableToInternalChan map[string]int
+var maxWalPerChan []*uint64
+var curTableChanIdx int
 
 var walLock sync.Mutex
 var maxWal uint64
@@ -99,11 +114,6 @@ type tableList []*regexp.Regexp
 
 var tables tableList
 var excludedTables tableList
-
-var kinesisClient *kinesis.Kinesis
-
-var records []*kinesis.PutRecordsRequestEntry
-var lastMsg *pgx.ReplicationMessage
 
 var tablesToStream map[string]bool
 
@@ -129,79 +139,62 @@ func print(a ...interface{}) {
 	fmt.Fprintln(os.Stdout, file, ":", line, " ", fmt.Sprint(a...))
 }
 
-func flushRecords(stream *string) (bool, error) {
-	if len(records) == 0 {
-		return false, nil
-	}
+func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry, errorChan chan<- error) {
+	for !done.IsSet() {
+		kinesisClient := kinesis.New(session.New(aws.NewConfig()))
+		seqForOrder := "0"
 
-	b := &backoff.Backoff{
-		Jitter: true,
-	}
-
-	for b.Attempt() < 100 && !done.IsSet() {
-		retryDuration := b.Duration()
-
-		startTime := time.Now()
-		out, err := kinesisClient.PutRecords(&kinesis.PutRecordsInput{
-			StreamName: stream,
-			Records:    records,
-		})
-		elapsed := time.Since(startTime)
-
-		if err != nil {
-			logerror(errors.Wrapf(err, "kinesis PutRecords failed; retrying failed records in %s", retryDuration.String()))
-			kinesisClient = kinesis.New(session.New(aws.NewConfig())) // refresh the client to get new credentials etc.
-			time.Sleep(retryDuration)
-		} else if *out.FailedRecordCount > 0 {
-			logerrf("%d records failed during Kinesis PutRecords; retrying in %s", *out.FailedRecordCount, retryDuration.String())
-			originalRecordsCount := uint64(len(records))
-			atomic.AddUint64(&stats.putRecordsTime, uint64(elapsed))
-			records = failures(records, out.Records)
-			atomic.AddUint64(&stats.putRecords, originalRecordsCount-uint64(len(records))) // total - unsent = sent
-			time.Sleep(retryDuration)
-		} else if *out.FailedRecordCount == 0 {
-			atomic.AddUint64(&stats.putRecordsTime, uint64(elapsed))
-			atomic.AddUint64(&stats.putRecords, uint64(len(records)))
-			if len(out.Records) > 0 {
-				latestKinesisSequenceNumber = *out.Records[len(out.Records)-1].SequenceNumber
+		for !done.IsSet() {
+			pre := <-records
+			if pre.skip {
+				ack(pre.msg, chanIdx)
+				continue
 			}
-			records = nil
-			return true, nil
+
+			b := &backoff.Backoff{
+				Jitter: true,
+			}
+
+			pri := kinesis.PutRecordInput{
+				Data:                      pre.json,
+				ExplicitHashKey:           nil,
+				PartitionKey:              &pre.pr.Relation,
+				StreamName:                pre.stream,
+				SequenceNumberForOrdering: &seqForOrder,
+			}
+
+			putSuccess := false
+
+			for b.Attempt() < 100 && !done.IsSet() && !putSuccess {
+				retryDuration := b.Duration()
+
+				startTime := time.Now()
+				out, err := kinesisClient.PutRecord(&pri)
+				elapsed := time.Since(startTime)
+
+				if err != nil {
+					logerror(errors.Wrapf(err, "kinesis PutRecords failed; retrying in %s", retryDuration.String()))
+					kinesisClient = kinesis.New(session.New(aws.NewConfig())) // refresh the client to get new credentials etc.
+					time.Sleep(retryDuration)
+					continue
+				}
+
+				print("success ", elapsed, " backlog ", len(records), " idx ", chanIdx)
+
+				atomic.AddUint64(&stats.putRecordsTime, uint64(elapsed))
+				atomic.AddUint64(&stats.putRecords, 1)
+
+				seqForOrder = *out.SequenceNumber
+				putSuccess = true
+				ack(pre.msg, chanIdx)
+			}
+
+			if !putSuccess {
+				errorChan <- errors.New("unable to replicate message after many attempts, or shutting down")
+				return
+			}
 		}
-
-		if done.IsSet() {
-			return false, errors.New("interrupted PutRecords due to shutdown")
-		}
 	}
-
-	return false, errors.New("failed to put records after many attempts")
-}
-
-func putRecord(jsonRecord []byte, tableSchema *string, stream *string) (bool, error) {
-	if len(jsonRecord) > maxRecordSize {
-		return false, errors.New("replication messages must be less than 1MB in size")
-	}
-
-	records = append(records, &kinesis.PutRecordsRequestEntry{
-		Data:         jsonRecord,
-		PartitionKey: tableSchema,
-	})
-
-	if len(records) < maxRecordsPerRequest {
-		return false, nil
-	}
-
-	return flushRecords(stream)
-}
-
-func failures(records []*kinesis.PutRecordsRequestEntry,
-	response []*kinesis.PutRecordsResultEntry) (out []*kinesis.PutRecordsRequestEntry) {
-	for i, record := range response {
-		if record.ErrorCode != nil {
-			out = append(out, records[i])
-		}
-	}
-	return out
 }
 
 func marshalColumnValue(cv *parselogical.ColumnValue) map[string]string {
@@ -232,6 +225,8 @@ func marshalColumnValuePair(newValue *parselogical.ColumnValue, oldValue *parsel
 }
 
 func marshalWALToJSON(pr *parselogical.ParseResult, msg *pgx.ReplicationMessage) ([]byte, error) {
+	lsn := pgx.FormatLSN(msg.WalMessage.WalStart)
+	time := time.Unix(0, int64(msg.WalMessage.ServerTime)).Format(time.RFC3339)
 	columns := make(map[string]map[string]map[string]string)
 
 	for k, v := range pr.Columns {
@@ -248,9 +243,6 @@ func marshalWALToJSON(pr *parselogical.ParseResult, msg *pgx.ReplicationMessage)
 		}
 	}
 
-	lsn := pgx.FormatLSN(msg.WalMessage.WalStart)
-	time := time.Unix(0, int64(msg.WalMessage.ServerTime)).Format(time.RFC3339)
-
 	return json.Marshal(struct {
 		Time      *string                                  `json:"time"`
 		Lsn       *string                                  `json:"lsn"`
@@ -266,6 +258,25 @@ func marshalWALToJSON(pr *parselogical.ParseResult, msg *pgx.ReplicationMessage)
 	})
 }
 
+func enqueueMsgForStream(r *putRecordEntry) error {
+	if len(r.json) > maxRecordSize {
+		return errors.New("replication messages must be less than 1MB in size")
+	}
+
+	chanIdx, ok := tableToInternalChan[r.pr.Relation]
+
+	if !ok {
+		chanIdx = curTableChanIdx % maxSenders
+		tableToInternalChan[r.pr.Relation] = chanIdx
+		curTableChanIdx++
+	}
+
+	c, _ := messagesToStream[chanIdx]
+
+	c <- r
+	return nil
+}
+
 func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 	var err error
 
@@ -278,7 +289,7 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 	}
 
 	if pr.Operation == "BEGIN" || pr.Operation == "COMMIT" {
-		return nil
+		return enqueueMsgForStream(&putRecordEntry{pr: pr, msg: msg.WalMessage, skip: true, json: nil, stream: nil})
 	}
 
 	include, ok := tablesToStream[pr.Relation]
@@ -305,7 +316,7 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 
 	if !include {
 		atomic.AddUint64(&stats.skipped, 1)
-		return nil
+		return enqueueMsgForStream(&putRecordEntry{pr: pr, msg: msg.WalMessage, skip: true, json: nil, stream: nil})
 	}
 
 	switch pr.Operation {
@@ -329,19 +340,10 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 		return errors.Wrap(err, "error serializing WAL record into JSON")
 	}
 
-	flushed, err := putRecord(jsonRecord, &pr.Relation, stream)
+	// print(string(msg.WalMessage.WalData))
+	// print(string(jsonRecord))
 
-	if err != nil {
-		return errors.Wrap(err, "unable to put record into Kinesis")
-	}
-
-	lastMsg = msg
-
-	if flushed {
-		ack(msg)
-	}
-
-	return nil
+	return enqueueMsgForStream(&putRecordEntry{pr: pr, msg: msg.WalMessage, skip: false, json: jsonRecord, stream: stream})
 }
 
 func replicationLoop(replicationMessages chan *pgx.ReplicationMessage, replicationFinished chan error, stream *string) {
@@ -355,17 +357,6 @@ func replicationLoop(replicationMessages chan *pgx.ReplicationMessage, replicati
 		case <-shutdown:
 			logerrf("shutting down replication loop")
 			return
-		case <-flush:
-			flushed, err := flushRecords(stream)
-
-			if err != nil {
-				replicationFinished <- err // already wrapped
-				return
-			}
-
-			if flushed {
-				ack(lastMsg)
-			}
 		case msg = <-replicationMessages:
 			err := handleReplicationMsg(msg, stream)
 
@@ -377,20 +368,28 @@ func replicationLoop(replicationMessages chan *pgx.ReplicationMessage, replicati
 	}
 }
 
-func ack(msg *pgx.ReplicationMessage) {
-	curMaxWal := atomic.LoadUint64(&maxWal)
+func ack(msg *pgx.WalMessage, chanIdx int) {
+	curMaxWal := atomic.LoadUint64(maxWalPerChan[chanIdx])
 
-	if curMaxWal < msg.WalMessage.WalStart {
-		atomic.StoreUint64(&maxWal, msg.WalMessage.WalStart)
-		forceAck.SetTo(true)
+	if curMaxWal < msg.WalStart {
+		atomic.StoreUint64(maxWalPerChan[chanIdx], msg.WalStart)
 	}
 }
 
 func sendKeepalive(conn *pgx.ReplicationConn, force bool) error {
-	curMaxWal := atomic.LoadUint64(&maxWal)
+	curMinAckedWal := uint64(0)
+	first := true
+	for _, v := range maxWalPerChan {
+		w := atomic.LoadUint64(v)
 
-	if force || forceAck.IsSet() || time.Since(lastStatus) >= DefaultKeepaliveTimeout || curMaxWal > maxWalSent {
-		status, err := pgx.NewStandbyStatus(curMaxWal)
+		if first || w < curMinAckedWal || w == curMinAckedWal+1 { // allow acking sequential wal values
+			curMinAckedWal = w
+			first = false
+		}
+	}
+
+	if force || time.Since(lastStatus) >= DefaultKeepaliveTimeout || curMinAckedWal > maxWalSent {
+		status, err := pgx.NewStandbyStatus(curMinAckedWal)
 		if err != nil {
 			return err
 		}
@@ -401,8 +400,7 @@ func sendKeepalive(conn *pgx.ReplicationConn, force bool) error {
 		}
 
 		lastStatus = time.Now()
-		maxWalSent = curMaxWal
-		forceAck.SetTo(false)
+		maxWalSent = curMinAckedWal
 	}
 
 	return nil
@@ -423,18 +421,25 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 		return errors.Wrapf(err, "unable to start replication to slot %s", *slot)
 	}
 
-	kinesisClient = kinesis.New(session.New(aws.NewConfig()))
-
 	lastStatus = time.Now()
 	initiallyConnected = true
 
 	replicationMessages := make(chan *pgx.ReplicationMessage)
 	replicationFinished := make(chan error, 1)
+	messagesToStream = make(map[int]chan *putRecordEntry)
+	tableToInternalChan = make(map[string]int)
+	maxWalPerChan = make([]*uint64, maxSenders)
+	curTableChanIdx = 0
 
 	lastStats := time.Now()
 	lastFlush := time.Now()
 
 	go replicationLoop(replicationMessages, replicationFinished, stream)
+
+	for i := 0; i < maxSenders; i++ {
+		messagesToStream[i] = make(chan *putRecordEntry, maxBacklog)
+		go putRecordWorker(i, stream, messagesToStream[i], replicationFinished)
+	}
 
 	logf("replication starting from LSN %s", pgx.FormatLSN(maxWalSent))
 
