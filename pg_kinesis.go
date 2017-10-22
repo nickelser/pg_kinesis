@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/signal"
 	"regexp"
@@ -24,6 +25,7 @@ import (
 	"github.com/jackc/pgx"
 	"github.com/nickelser/parselogical"
 
+	"github.com/dustin/go-humanize"
 	"github.com/jpillora/backoff"
 	"github.com/pkg/errors"
 	"github.com/tevino/abool"
@@ -49,7 +51,7 @@ Options:
 `
 
 // DefaultKeepaliveTimeout is the time before we proactively send a keepalive & status update
-const DefaultKeepaliveTimeout = 5 * time.Second
+const DefaultKeepaliveTimeout = 4 * time.Second
 
 // ReplicationLoopInterval is the time between update checks
 const ReplicationLoopInterval = 1 * time.Second
@@ -64,7 +66,7 @@ const InitialReconnectInterval = 5 * time.Second
 const StatsInterval = 10 * time.Second
 
 // FlushInterval is the interval between forced Kinesis flushes
-const FlushInterval = 1 * time.Second
+const FlushInterval = 500 * time.Millisecond
 
 const (
 	maxRecordSize        = 1 << 20 // 1MiB
@@ -72,8 +74,8 @@ const (
 	maxRecordsPerRequest = 500
 )
 
-const maxSenders = 24
-const maxBacklog = 48
+const maxSenders = 2
+const maxBacklog = 10000 // per channel
 
 var stats struct {
 	updates        uint64
@@ -82,6 +84,7 @@ var stats struct {
 	skipped        uint64
 	putRecords     uint64
 	putRecordsTime uint64
+	lag            uint64
 }
 
 type putRecordEntry struct {
@@ -95,20 +98,19 @@ type putRecordEntry struct {
 var sigs = make(chan os.Signal, 1)
 var restart = make(chan bool, 1)
 var shutdown = make(chan bool, 1)
-var flush = make(chan bool, 1)
 var done = abool.New()
 
 var messagesToStream map[int]chan *putRecordEntry
 var tableToInternalChan map[string]int
-var maxWalPerChan []*uint64
-var curTableChanIdx int
+var maxAckWalPerChan []uint64
 
-var walLock sync.Mutex
+var curTableChanIdx int
+var pks sync.Map
 var maxWal uint64
+var maxRecvWal uint64
 var latestKinesisSequenceNumber string
 var maxWalSent uint64
 var lastStatus time.Time
-var lastFlush time.Time
 
 type tableList []*regexp.Regexp
 
@@ -139,62 +141,144 @@ func print(a ...interface{}) {
 	fmt.Fprintln(os.Stdout, file, ":", line, " ", fmt.Sprint(a...))
 }
 
+/*
+	new algo:
+		- pull down every record
+		- check if 1/ flush time has elapsed 2/ the record's primary keys have already been seen
+		- if true, flush the current buffer, and add the new record to the buffer (buffer max size = 500)
+		- refresh pkeys every few minutes?
+*/
 func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry, errorChan chan<- error) {
 	for !done.IsSet() {
 		kinesisClient := kinesis.New(session.New(aws.NewConfig()))
-		seqForOrder := "0"
+		buffer := make([]*kinesis.PutRecordsRequestEntry, 0)
+		seenUniqRecords := make(map[string]bool)
+		lastFlush := time.Now()
+		var lastCommitMsgInBuffer *pgx.WalMessage
+		var pre *putRecordEntry
 
 		for !done.IsSet() {
-			pre := <-records
-			if pre.skip {
-				ack(pre.msg, chanIdx)
-				continue
-			}
+			alreadySeen := false
+			pre = nil
 
-			b := &backoff.Backoff{
-				Jitter: true,
-			}
+			select {
+			case pre = <-records:
+				if pre.pr.Operation == "COMMIT" {
+					lastCommitMsgInBuffer = pre.msg
+				}
 
-			pri := kinesis.PutRecordInput{
-				Data:                      pre.json,
-				ExplicitHashKey:           nil,
-				PartitionKey:              &pre.pr.Relation,
-				StreamName:                pre.stream,
-				SequenceNumberForOrdering: &seqForOrder,
-			}
-
-			putSuccess := false
-
-			for b.Attempt() < 100 && !done.IsSet() && !putSuccess {
-				retryDuration := b.Duration()
-
-				startTime := time.Now()
-				out, err := kinesisClient.PutRecord(&pri)
-				elapsed := time.Since(startTime)
-
-				if err != nil {
-					logerror(errors.Wrapf(err, "kinesis PutRecords failed; retrying in %s", retryDuration.String()))
-					kinesisClient = kinesis.New(session.New(aws.NewConfig())) // refresh the client to get new credentials etc.
-					time.Sleep(retryDuration)
+				if pre.skip {
 					continue
 				}
 
-				print("success ", elapsed, " backlog ", len(records), " idx ", chanIdx)
+				key := pre.pr.Relation
+				relationPkeys, ok := pks.Load(pre.pr.Relation)
+				var columnNames []string
 
-				atomic.AddUint64(&stats.putRecordsTime, uint64(elapsed))
-				atomic.AddUint64(&stats.putRecords, 1)
+				// here we construct a key out of the record
+				// composed of its relation, and all of it's primary key values (if any)
+				// if we do not have any primary keys, just use all the keys
+				if ok {
+					columnNames = relationPkeys.([]string)
+				} else {
+					columnNames := make([]string, len(pre.pr.Columns))
 
-				seqForOrder = *out.SequenceNumber
-				putSuccess = true
-				ack(pre.msg, chanIdx)
+					i := 0
+					for k := range pre.pr.Columns {
+						columnNames[i] = k
+						i++
+					}
+				}
+
+				for _, col := range columnNames {
+					key += col
+					v, ok := pre.pr.Columns[col]
+					if ok {
+						if v.Quoted {
+							key += "q"
+						} else {
+							key += "n"
+						}
+						key += v.Value
+					}
+				}
+
+				_, alreadySeen = seenUniqRecords[key]
+				seenUniqRecords[key] = true
+			case <-time.After(FlushInterval):
+				if len(buffer) == 0 {
+					lastFlush = time.Now()
+				}
 			}
 
-			if !putSuccess {
-				errorChan <- errors.New("unable to replicate message after many attempts, or shutting down")
-				return
+			if len(buffer) > 0 && (alreadySeen || time.Since(lastFlush) >= FlushInterval || len(buffer) > maxRecordsPerRequest-1) {
+				b := &backoff.Backoff{
+					Jitter: true,
+				}
+
+				putSuccess := false
+
+				for b.Attempt() < 100 && !done.IsSet() && !putSuccess {
+					retryDuration := b.Duration()
+
+					startTime := time.Now()
+					out, err := kinesisClient.PutRecords(&kinesis.PutRecordsInput{
+						StreamName: stream,
+						Records:    buffer,
+					})
+					elapsed := time.Since(startTime)
+
+					if err != nil {
+						logerror(errors.Wrapf(err, "kinesis PutRecords failed; retrying failed records in %s", retryDuration.String()))
+						kinesisClient = kinesis.New(session.New(aws.NewConfig())) // refresh the client to get new credentials etc.
+						time.Sleep(retryDuration)
+						continue
+					} else if *out.FailedRecordCount > 0 {
+						logerrf("%d records failed during Kinesis PutRecords; retrying in %s", *out.FailedRecordCount, retryDuration.String())
+						originalRecordsCount := uint64(len(buffer))
+						atomic.AddUint64(&stats.putRecordsTime, uint64(elapsed))
+						buffer = failures(buffer, out.Records)
+						atomic.AddUint64(&stats.putRecords, originalRecordsCount-uint64(len(buffer))) // total - unsent = sent
+						time.Sleep(retryDuration)
+						continue
+					}
+
+					putSuccess = true
+					atomic.AddUint64(&stats.putRecordsTime, uint64(elapsed))
+					atomic.AddUint64(&stats.putRecords, uint64(len(buffer)))
+					if lastCommitMsgInBuffer != nil {
+						ack(lastCommitMsgInBuffer, chanIdx)
+					}
+					buffer = nil
+					seenUniqRecords = make(map[string]bool)
+					lastFlush = time.Now()
+					break
+				}
+
+				if !putSuccess {
+					errorChan <- errors.New("unable to replicate message after many attempts, or shutting down")
+					return
+				}
+			}
+
+			if pre != nil {
+				buffer = append(buffer, &kinesis.PutRecordsRequestEntry{
+					Data:         pre.json,
+					PartitionKey: &pre.pr.Relation,
+				})
 			}
 		}
 	}
+}
+
+func failures(records []*kinesis.PutRecordsRequestEntry,
+	response []*kinesis.PutRecordsResultEntry) (out []*kinesis.PutRecordsRequestEntry) {
+	for i, record := range response {
+		if record.ErrorCode != nil {
+			out = append(out, records[i])
+		}
+	}
+	return out
 }
 
 func marshalColumnValue(cv *parselogical.ColumnValue) map[string]string {
@@ -263,17 +347,26 @@ func enqueueMsgForStream(r *putRecordEntry) error {
 		return errors.New("replication messages must be less than 1MB in size")
 	}
 
-	chanIdx, ok := tableToInternalChan[r.pr.Relation]
+	if r.pr.Operation == "COMMIT" {
+		atomic.StoreUint64(&maxRecvWal, r.msg.WalStart)
 
-	if !ok {
-		chanIdx = curTableChanIdx % maxSenders
-		tableToInternalChan[r.pr.Relation] = chanIdx
-		curTableChanIdx++
+		for _, c := range messagesToStream {
+			c <- r
+		}
+	} else if !r.skip {
+		chanIdx, ok := tableToInternalChan[r.pr.Relation]
+
+		if !ok {
+			chanIdx = curTableChanIdx % maxSenders
+			tableToInternalChan[r.pr.Relation] = chanIdx
+			curTableChanIdx++
+		}
+
+		c, _ := messagesToStream[chanIdx]
+
+		c <- r
 	}
 
-	c, _ := messagesToStream[chanIdx]
-
-	c <- r
 	return nil
 }
 
@@ -340,9 +433,6 @@ func handleReplicationMsg(msg *pgx.ReplicationMessage, stream *string) error {
 		return errors.Wrap(err, "error serializing WAL record into JSON")
 	}
 
-	// print(string(msg.WalMessage.WalData))
-	// print(string(jsonRecord))
-
 	return enqueueMsgForStream(&putRecordEntry{pr: pr, msg: msg.WalMessage, skip: false, json: jsonRecord, stream: stream})
 }
 
@@ -369,27 +459,45 @@ func replicationLoop(replicationMessages chan *pgx.ReplicationMessage, replicati
 }
 
 func ack(msg *pgx.WalMessage, chanIdx int) {
-	curMaxWal := atomic.LoadUint64(maxWalPerChan[chanIdx])
+	curMaxWal := atomic.LoadUint64(&maxAckWalPerChan[chanIdx])
 
-	if curMaxWal < msg.WalStart {
-		atomic.StoreUint64(maxWalPerChan[chanIdx], msg.WalStart)
+	if msg.WalStart > curMaxWal {
+		atomic.StoreUint64(&maxAckWalPerChan[chanIdx], msg.WalStart)
 	}
 }
 
 func sendKeepalive(conn *pgx.ReplicationConn, force bool) error {
-	curMinAckedWal := uint64(0)
-	first := true
-	for _, v := range maxWalPerChan {
-		w := atomic.LoadUint64(v)
+	if force || time.Since(lastStatus) >= DefaultKeepaliveTimeout {
+		// iterate through the max actually persisted messages per channel and
+		// mark the current max wal as min(max(fully replicated channels), not fully replicated channels)
+		curMinUnackedWal := uint64(math.MaxUint64)
+		curMaxAckedWal := uint64(0)
+		recvd := atomic.LoadUint64(&maxRecvWal)
+		for i := range maxAckWalPerChan {
+			acked := atomic.LoadUint64(&maxAckWalPerChan[i])
 
-		if first || w < curMinAckedWal || w == curMinAckedWal+1 { // allow acking sequential wal values
-			curMinAckedWal = w
-			first = false
+			if acked == uint64(0) {
+				continue
+			}
+
+			if acked > curMaxAckedWal {
+				curMaxAckedWal = acked
+			}
+
+			if acked != recvd && acked < curMinUnackedWal {
+				curMinUnackedWal = acked
+			}
 		}
-	}
 
-	if force || time.Since(lastStatus) >= DefaultKeepaliveTimeout || curMinAckedWal > maxWalSent {
-		status, err := pgx.NewStandbyStatus(curMinAckedWal)
+		curWalMax := uint64(0)
+
+		if curMinUnackedWal < curMaxAckedWal {
+			curWalMax = curMinUnackedWal
+		} else if curMaxAckedWal > 0 {
+			curWalMax = curMaxAckedWal
+		}
+
+		status, err := pgx.NewStandbyStatus(curWalMax)
 		if err != nil {
 			return err
 		}
@@ -400,19 +508,144 @@ func sendKeepalive(conn *pgx.ReplicationConn, force bool) error {
 		}
 
 		lastStatus = time.Now()
-		maxWalSent = curMinAckedWal
+		atomic.StoreUint64(&maxWalSent, curWalMax)
 	}
 
 	return nil
+}
+
+func statsLoop() {
+	for !done.IsSet() {
+		time.Sleep(StatsInterval)
+
+		timePerInsert := float64(0)
+		putRecordsTime := atomic.LoadUint64(&stats.putRecordsTime)
+		putRecords := atomic.LoadUint64(&stats.putRecords)
+		inserts := atomic.LoadUint64(&stats.inserts)
+		updates := atomic.LoadUint64(&stats.updates)
+		deletes := atomic.LoadUint64(&stats.deletes)
+		skipped := atomic.LoadUint64(&stats.skipped)
+		lag := atomic.LoadUint64(&stats.lag)
+		mws := atomic.LoadUint64(&maxWalSent)
+		backlog := 0
+		if time.Duration(putRecordsTime) > 0 {
+			timePerInsert = (float64(putRecordsTime) / float64(time.Millisecond)) / float64(putRecords)
+		}
+		for i := 0; i < maxSenders; i++ {
+			backlog += len(messagesToStream[i])
+		}
+		// todo: query for current lag in mb
+		logf("inserts=%d (%.1f/s) updates=%d (%.1f/s) deletes=%d (%.1f/s) skipped=%d (%.1f/s) putrecords=%d (%.1f/s, %.0fms/record, %.1fs total) backlog=%d lsn=%s lag=%s",
+			inserts, float64(inserts)/StatsInterval.Seconds(),
+			updates, float64(updates)/StatsInterval.Seconds(),
+			deletes, float64(deletes)/StatsInterval.Seconds(),
+			skipped, float64(skipped)/StatsInterval.Seconds(),
+			putRecords, float64(putRecords)/StatsInterval.Seconds(), timePerInsert, float64(putRecordsTime)/float64(time.Second),
+			backlog,
+			pgx.FormatLSN(mws),
+			humanize.Bytes(lag))
+		atomic.StoreUint64(&stats.inserts, 0)
+		atomic.StoreUint64(&stats.updates, 0)
+		atomic.StoreUint64(&stats.deletes, 0)
+		atomic.StoreUint64(&stats.skipped, 0)
+		atomic.StoreUint64(&stats.putRecords, 0)
+		atomic.StoreUint64(&stats.putRecordsTime, 0)
+	}
+}
+
+func fetchPKs(conn *pgx.Conn) error {
+	rows, err := conn.Query(`
+	  SELECT
+      tc.table_schema || '.' || tc.table_name AS table_schema,
+      array_agg(kcu.column_name::text) AS pkeys
+    FROM
+      information_schema.table_constraints tc
+    LEFT JOIN
+      information_schema.key_column_usage kcu
+      ON tc.constraint_catalog = kcu.constraint_catalog
+      AND tc.constraint_schema = kcu.constraint_schema
+      AND tc.constraint_name = kcu.constraint_name
+    WHERE
+      tc.constraint_type = 'PRIMARY KEY'
+    GROUP BY
+      tc.table_schema || '.' || tc.table_name`)
+	if err != nil {
+		return err
+	}
+
+	defer rows.Close()
+
+	// Iterate through the result set
+	for rows.Next() {
+		var schemaTable string
+		var pk []string
+
+		err = rows.Scan(&schemaTable, &pk)
+		if err != nil {
+			return err
+		}
+
+		pks.Store(schemaTable, pk)
+	}
+
+	if rows.Err() != nil {
+		return err
+	}
+
+	return nil
+}
+
+func fetchLag(slot *string, conn *pgx.Conn) error {
+	var lag uint64
+
+	err := conn.QueryRow(fmt.Sprintf(`
+	 	SELECT
+	  	pg_current_xlog_location() - confirmed_flush_lsn
+	 	FROM pg_replication_slots
+	 	WHERE slot_name = '%s';`, *slot)).Scan(&lag)
+
+	if err != nil {
+		return err
+	}
+
+	atomic.StoreUint64(&stats.lag, lag)
+	return nil
+}
+
+func pkeyLagLoop(slot *string, nonReplConn *pgx.Conn, replicationFinished chan error) {
+	for !done.IsSet() {
+		err := fetchPKs(nonReplConn)
+		if err != nil {
+			replicationFinished <- err
+			return
+		}
+		err = fetchLag(slot, nonReplConn)
+		if err != nil {
+			replicationFinished <- err
+			return
+		}
+		time.Sleep(StatsInterval - 1)
+	}
 }
 
 func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *string) error {
 	var err error
 	var replErr error
 
+	// have to make a copy, as pgx stores the dialer information in the ConnConfig
+	// which is not compatible across replication and non-replication connections
+	// todo - less ugly way of accomplishing this...
+	sourceConfigCpy := pgx.ConnConfig{Host: sourceConfig.Host, Port: sourceConfig.Port, Database: sourceConfig.Database, User: sourceConfig.User, Password: sourceConfig.Password, TLSConfig: sourceConfig.TLSConfig, UseFallbackTLS: sourceConfig.UseFallbackTLS, FallbackTLSConfig: sourceConfig.FallbackTLSConfig}
+
+	nonReplConn, err := pgx.Connect(sourceConfigCpy)
+	if err != nil {
+		return errors.Wrapf(err, "unable to establish connection to target DB %s/%s", sourceConfig.Host, sourceConfig.Database)
+	}
+	defer nonReplConn.Close()
+
 	conn, err := pgx.ReplicationConnect(sourceConfig)
 	if err != nil {
-		return errors.Wrapf(err, "unable to establish connection to source DB %s/%s", sourceConfig.Host, sourceConfig.Database)
+		return errors.Wrapf(err, "unable to establish replication connection to source DB %s/%s", sourceConfig.Host, sourceConfig.Database)
 	}
 	defer conn.Close()
 
@@ -428,12 +661,10 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 	replicationFinished := make(chan error, 1)
 	messagesToStream = make(map[int]chan *putRecordEntry)
 	tableToInternalChan = make(map[string]int)
-	maxWalPerChan = make([]*uint64, maxSenders)
+	maxAckWalPerChan = make([]uint64, maxSenders)
 	curTableChanIdx = 0
 
-	lastStats := time.Now()
-	lastFlush := time.Now()
-
+	go pkeyLagLoop(slot, nonReplConn, replicationFinished)
 	go replicationLoop(replicationMessages, replicationFinished, stream)
 
 	for i := 0; i < maxSenders; i++ {
@@ -442,6 +673,8 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 	}
 
 	logf("replication starting from LSN %s", pgx.FormatLSN(maxWalSent))
+
+	go statsLoop()
 
 	for !done.IsSet() {
 		var message *pgx.ReplicationMessage
@@ -481,46 +714,6 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 		err = sendKeepalive(conn, keepaliveRequested)
 		if err != nil {
 			return errors.Wrap(err, "unable to send keepalive")
-		}
-
-		sinceLastFlush := time.Since(lastFlush)
-
-		if sinceLastFlush >= FlushInterval {
-			// non-blocking send to flush
-			select {
-			case flush <- true:
-				lastFlush = time.Now()
-			default: // already has a flush queued up, so don't block
-			}
-		}
-
-		sinceLastStats := time.Since(lastStats)
-		if sinceLastStats >= StatsInterval {
-			lastStats = time.Now()
-			timePerInsert := float64(0)
-			putRecordsTime := atomic.LoadUint64(&stats.putRecordsTime)
-			putRecords := atomic.LoadUint64(&stats.putRecords)
-			inserts := atomic.LoadUint64(&stats.inserts)
-			updates := atomic.LoadUint64(&stats.updates)
-			deletes := atomic.LoadUint64(&stats.deletes)
-			skipped := atomic.LoadUint64(&stats.skipped)
-			if time.Duration(putRecordsTime) > 0 {
-				timePerInsert = (float64(putRecordsTime) / float64(time.Millisecond)) / float64(putRecords)
-			}
-			logf("inserts=%d (%.1f/s) updates=%d (%.1f/s) deletes=%d (%.1f/s) skipped=%d (%.1f/s) putrecords=%d (%.1f/s, %.0fms/record, %.1fs total) lsn=%s seq=%s",
-				inserts, float64(inserts)/sinceLastStats.Seconds(),
-				updates, float64(updates)/sinceLastStats.Seconds(),
-				deletes, float64(deletes)/sinceLastStats.Seconds(),
-				skipped, float64(skipped)/sinceLastStats.Seconds(),
-				putRecords, float64(putRecords)/sinceLastStats.Seconds(), timePerInsert, float64(putRecordsTime)/float64(time.Second),
-				pgx.FormatLSN(maxWalSent),
-				latestKinesisSequenceNumber)
-			atomic.StoreUint64(&stats.inserts, 0)
-			atomic.StoreUint64(&stats.updates, 0)
-			atomic.StoreUint64(&stats.deletes, 0)
-			atomic.StoreUint64(&stats.skipped, 0)
-			atomic.StoreUint64(&stats.putRecords, 0)
-			atomic.StoreUint64(&stats.putRecordsTime, 0)
 		}
 	}
 
@@ -688,6 +881,11 @@ func main() {
 			} else {
 				time.Sleep(InitialReconnectInterval)
 			}
+		} else {
+			if err != nil {
+				os.Exit(1)
+			}
+			os.Exit(0)
 		}
 	}
 }
