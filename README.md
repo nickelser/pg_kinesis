@@ -28,8 +28,6 @@ Options:
   -t --table            Table to transfer. Multiple tables can be selected by writing multiple -t switches. Defaults to all tables. The matching semantics are the same as psql (https://www.postgresql.org/docs/current/static/app-psql.html#app-psql-patterns)
   -T --exclude-table    Table to exclude. Defaults to excluding no tables. The matching logic is the same as for -t; -T has higher precedence than -t.
   --retry-initial       If this flag is present, retry the initial connection to the replication slot; useful for high-availability setups where the same pg_kinesis command is run from multiple hosts.
-  --max-senders         Maximum number of parallel senders to AWS Kinesis. Each table is sent single-threaded for consistency, so upping this value is useful if you have many tables. (default: 24)
-  --max-backlog         Maximum backlog of replication messages to hold before blocking replication. (default: 2 x --max-senders)
 ```
 
 Sample psql input and Kinesis stream output:
