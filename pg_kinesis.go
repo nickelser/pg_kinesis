@@ -66,7 +66,7 @@ const InitialReconnectInterval = 5 * time.Second
 const StatsInterval = 10 * time.Second
 
 // FlushInterval is the interval between forced Kinesis flushes
-const FlushInterval = 500 * time.Millisecond
+const FlushInterval = 100 * time.Millisecond
 
 const (
 	maxRecordSize        = 1 << 20 // 1MiB
@@ -74,7 +74,7 @@ const (
 	maxRecordsPerRequest = 500
 )
 
-const maxSenders = 2
+const maxSenders = 16
 const maxBacklog = 10000 // per channel
 
 var stats struct {
@@ -154,8 +154,10 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 		buffer := make([]*kinesis.PutRecordsRequestEntry, 0)
 		seenUniqRecords := make(map[string]bool)
 		lastFlush := time.Now()
+		bufSize := 0
 		var lastCommitMsgInBuffer *pgx.WalMessage
 		var pre *putRecordEntry
+		var key string
 
 		for !done.IsSet() {
 			alreadySeen := false
@@ -171,7 +173,7 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 					continue
 				}
 
-				key := pre.pr.Relation
+				key = pre.pr.Relation
 				relationPkeys, ok := pks.Load(pre.pr.Relation)
 				var columnNames []string
 
@@ -211,7 +213,15 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 				}
 			}
 
-			if len(buffer) > 0 && (alreadySeen || time.Since(lastFlush) >= FlushInterval || len(buffer) > maxRecordsPerRequest-1) {
+			// the message size is the data blob length + the partition key size
+			msgSize := 0
+
+			if pre != nil {
+				msgSize = len(pre.json) + len([]byte(pre.pr.Relation))
+			}
+
+			if len(buffer) > 0 &&
+				(alreadySeen || time.Since(lastFlush) >= FlushInterval || len(buffer) > maxRecordsPerRequest-1 || bufSize+msgSize >= maxRequestSize) {
 				b := &backoff.Backoff{
 					Jitter: true,
 				}
@@ -252,6 +262,7 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 					buffer = nil
 					seenUniqRecords = make(map[string]bool)
 					lastFlush = time.Now()
+					bufSize = 0
 					break
 				}
 
@@ -266,6 +277,7 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 					Data:         pre.json,
 					PartitionKey: &pre.pr.Relation,
 				})
+				bufSize += msgSize
 			}
 		}
 	}
@@ -534,7 +546,6 @@ func statsLoop() {
 		for i := 0; i < maxSenders; i++ {
 			backlog += len(messagesToStream[i])
 		}
-		// todo: query for current lag in mb
 		logf("inserts=%d (%.1f/s) updates=%d (%.1f/s) deletes=%d (%.1f/s) skipped=%d (%.1f/s) putrecords=%d (%.1f/s, %.0fms/record, %.1fs total) backlog=%d lsn=%s lag=%s",
 			inserts, float64(inserts)/StatsInterval.Seconds(),
 			updates, float64(updates)/StatsInterval.Seconds(),
@@ -600,7 +611,7 @@ func fetchLag(slot *string, conn *pgx.Conn) error {
 
 	err := conn.QueryRow(fmt.Sprintf(`
 	 	SELECT
-	  	pg_current_xlog_location() - confirmed_flush_lsn
+	  	pg_current_xlog_location() - restart_lsn
 	 	FROM pg_replication_slots
 	 	WHERE slot_name = '%s';`, *slot)).Scan(&lag)
 
@@ -847,11 +858,23 @@ func main() {
 	}
 
 	if *create {
-		logerror(createReplicationSlot(slot, sourceConfig))
+		err := createReplicationSlot(slot, sourceConfig)
+		logerror(err)
+
+		// todo -- do not exit(1) on duplicate slot (as that is fine)
+		// ignore ERROR: replication slot "pg_kinesis" already exists (SQLSTATE 42710)
+		if err != nil {
+			os.Exit(1)
+		}
 	}
 
 	if *drop {
-		logerror(dropReplicationSlot(slot, sourceConfig))
+		err := dropReplicationSlot(slot, sourceConfig)
+		logerror(err)
+
+		if err != nil {
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
