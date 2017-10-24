@@ -861,10 +861,12 @@ func main() {
 		err := createReplicationSlot(slot, sourceConfig)
 		logerror(err)
 
-		// todo -- do not exit(1) on duplicate slot (as that is fine)
-		// ignore ERROR: replication slot "pg_kinesis" already exists (SQLSTATE 42710)
 		if err != nil {
-			os.Exit(1)
+			if strings.HasSuffix(err.Error(), "(SQLSTATE 42710)") {
+				logf("replication slot %s already exists, continuing", *slot)
+			} else {
+				os.Exit(1)
+			}
 		}
 	}
 
