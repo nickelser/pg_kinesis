@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"os"
 	"os/signal"
@@ -92,6 +93,7 @@ type putRecordEntry struct {
 	msg    *pgx.WalMessage
 	pr     *parselogical.ParseResult
 	skip   bool
+	key    *string
 	json   []byte
 }
 
@@ -157,7 +159,6 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 		bufSize := 0
 		var lastCommitMsgInBuffer *pgx.WalMessage
 		var pre *putRecordEntry
-		var key string
 
 		for !done.IsSet() {
 			alreadySeen := false
@@ -173,40 +174,8 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 					continue
 				}
 
-				key = pre.pr.Relation
-				relationPkeys, ok := pks.Load(pre.pr.Relation)
-				var columnNames []string
-
-				// here we construct a key out of the record
-				// composed of its relation, and all of it's primary key values (if any)
-				// if we do not have any primary keys, just use all the keys
-				if ok {
-					columnNames = relationPkeys.([]string)
-				} else {
-					columnNames := make([]string, len(pre.pr.Columns))
-
-					i := 0
-					for k := range pre.pr.Columns {
-						columnNames[i] = k
-						i++
-					}
-				}
-
-				for _, col := range columnNames {
-					key += col
-					v, ok := pre.pr.Columns[col]
-					if ok {
-						if v.Quoted {
-							key += "q"
-						} else {
-							key += "n"
-						}
-						key += v.Value
-					}
-				}
-
-				_, alreadySeen = seenUniqRecords[key]
-				seenUniqRecords[key] = true
+				_, alreadySeen = seenUniqRecords[*pre.key]
+				seenUniqRecords[*pre.key] = true
 			case <-time.After(FlushInterval):
 				if len(buffer) == 0 {
 					lastFlush = time.Now()
@@ -215,9 +184,15 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 
 			// the message size is the data blob length + the partition key size
 			msgSize := 0
+			partitionKey := ""
 
 			if pre != nil {
-				msgSize = len(pre.json) + len([]byte(pre.pr.Relation))
+				msgSize = len(pre.json) + len([]byte(*pre.key))
+				partitionKey = *pre.key
+				// truncate to maximum partition key length
+				if len(partitionKey) > 256 {
+					partitionKey = partitionKey[0:256]
+				}
 			}
 
 			if len(buffer) > 0 &&
@@ -275,7 +250,7 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 			if pre != nil {
 				buffer = append(buffer, &kinesis.PutRecordsRequestEntry{
 					Data:         pre.json,
-					PartitionKey: &pre.pr.Relation,
+					PartitionKey: &partitionKey,
 				})
 				bufSize += msgSize
 			}
@@ -366,15 +341,34 @@ func enqueueMsgForStream(r *putRecordEntry) error {
 			c <- r
 		}
 	} else if !r.skip {
-		chanIdx, ok := tableToInternalChan[r.pr.Relation]
+		key := r.pr.Relation
+		relationPkeys, ok := pks.Load(r.pr.Relation)
 
-		if !ok {
-			chanIdx = curTableChanIdx % maxSenders
-			tableToInternalChan[r.pr.Relation] = chanIdx
-			curTableChanIdx++
+		// here we construct a key out of the record
+		// composed of its relation, and all of it's primary key values (if any)
+		// if we do not have any primary keys, we have to flush after every insert into the table
+		if ok {
+			for _, col := range relationPkeys.([]string) {
+				key += col
+				v, ok := r.pr.Columns[col]
+				if ok {
+					if v.Quoted {
+						key += "q"
+					} else {
+						key += "n"
+					}
+					key += v.Value
+				}
+			}
 		}
 
-		c, _ := messagesToStream[chanIdx]
+		r.key = &key
+
+		hashKey := fnv.New64a()
+		hashKey.Write([]byte(key))
+		internalShardIdx := int(hashKey.Sum64() % maxSenders)
+
+		c, _ := messagesToStream[internalShardIdx]
 
 		c <- r
 	}
