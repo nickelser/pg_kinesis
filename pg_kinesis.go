@@ -88,15 +88,6 @@ var stats struct {
 	lag            uint64
 }
 
-type putRecordEntry struct {
-	stream *string
-	msg    *pgx.WalMessage
-	pr     *parselogical.ParseResult
-	skip   bool
-	key    *string
-	json   []byte
-}
-
 var sigs = make(chan os.Signal, 1)
 var restart = make(chan bool, 1)
 var shutdown = make(chan bool, 1)
