@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"flag"
@@ -16,18 +18,14 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-)
 
-import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/kinesis"
-
-	"github.com/jackc/pgx"
-	"github.com/nickelser/parselogical"
-
 	"github.com/dustin/go-humanize"
+	"github.com/jackc/pgx"
 	"github.com/jpillora/backoff"
+	"github.com/nickelser/parselogical"
 	"github.com/pkg/errors"
 	"github.com/tevino/abool"
 )
@@ -88,15 +86,6 @@ var stats struct {
 	lag            uint64
 }
 
-type putRecordEntry struct {
-	stream *string
-	msg    *pgx.WalMessage
-	pr     *parselogical.ParseResult
-	skip   bool
-	key    *string
-	json   []byte
-}
-
 var sigs = make(chan os.Signal, 1)
 var restart = make(chan bool, 1)
 var shutdown = make(chan bool, 1)
@@ -113,6 +102,7 @@ var maxRecvWal uint64
 var latestKinesisSequenceNumber string
 var maxWalSent uint64
 var lastStatus time.Time
+var useLeoFormat bool
 
 type tableList []*regexp.Regexp
 
@@ -297,7 +287,7 @@ func marshalColumnValuePair(newValue *parselogical.ColumnValue, oldValue *parsel
 
 func marshalWALToJSON(pr *parselogical.ParseResult, msg *pgx.ReplicationMessage) ([]byte, error) {
 	lsn := pgx.FormatLSN(msg.WalMessage.WalStart)
-	time := time.Unix(0, int64(msg.WalMessage.ServerTime)).Format(time.RFC3339)
+	msgTime := time.Unix(0, int64(msg.WalMessage.ServerTime)).Format(time.RFC3339)
 	columns := make(map[string]map[string]map[string]string)
 
 	for k, v := range pr.Columns {
@@ -314,19 +304,38 @@ func marshalWALToJSON(pr *parselogical.ParseResult, msg *pgx.ReplicationMessage)
 		}
 	}
 
-	return json.Marshal(struct {
-		Time      *string                                  `json:"time"`
-		Lsn       *string                                  `json:"lsn"`
-		Table     *string                                  `json:"table"`
-		Operation *string                                  `json:"operation"`
-		Columns   *map[string]map[string]map[string]string `json:"columns"`
-	}{
-		Time:      &time,
+	dataJSON := defaultJSON{
+		Time:      &msgTime,
 		Lsn:       &lsn,
 		Table:     &pr.Relation,
 		Operation: &pr.Operation,
 		Columns:   &columns,
-	})
+	}
+
+	if !useLeoFormat {
+		return json.Marshal(dataJSON)
+	}
+
+	// TODO: Dynamic ID? configurable Event (queue name)?
+	leoJSON := leoJSON{
+		ID:                   "pg_kinesis_ingest",
+		Event:                "postgreSQL_ingest_test_decoder",
+		Payload:              dataJSON,
+		EventSourceTimestamp: int64(msg.WalMessage.ServerTime / 1000000),
+		Timestamp:            int64(time.Now().UnixNano() / 1000000),
+	}
+
+	var dataByes, err = json.Marshal(leoJSON)
+	if err != nil {
+		return nil, errors.Wrapf(err, "unable to serialize to LEO")
+	}
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	zw.Write(dataByes)
+	zw.Write([]byte("\n"))
+	zw.Close()
+
+	return buf.Bytes(), nil
 }
 
 func enqueueMsgForStream(r *putRecordEntry) error {
@@ -801,6 +810,7 @@ func main() {
 	retryInitial := flag.Bool("retry-initial", false, "")
 	slot := flag.String("slot", "pg_kinesis", "")
 	stream := flag.String("stream", "", "")
+	flag.BoolVar(&useLeoFormat, "leo", false, "")
 	flag.Var(&tables, "table", "")
 	flag.Var(&tables, "t", "")
 	flag.Var(&excludedTables, "exclude-table", "")
