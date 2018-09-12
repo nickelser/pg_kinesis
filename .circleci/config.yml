@@ -1,0 +1,14 @@
+# Golang CircleCI 2.0 configuration file
+#
+# Check https://circleci.com/docs/2.0/language-go/ for more details
+version: 2
+jobs:
+  build:
+    machine: true
+    working_directory: /home/circleci/.go_workspace/org/pg_kinesis
+    steps:
+      - checkout
+      - run: go get github.com/tools/godep
+      - run: godep restore ./...
+      - run: go test -v ./...
+      - run: go build -o pg_kinesis ./...

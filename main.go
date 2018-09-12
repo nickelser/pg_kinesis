@@ -97,6 +97,23 @@ type putRecordEntry struct {
 	json   []byte
 }
 
+// This is the format we marshall the WAL entry into before injecting it into Kinesis
+type jsonWalEntry struct {
+	Time      *string                                  `json:"time"`
+	Lsn       *string                                  `json:"lsn"`
+	Table     *string                                  `json:"table"`
+	Operation *string                                  `json:"operation"`
+	Columns   *map[string]map[string]map[string]string `json:"columns"`
+}
+
+// Global Client Objects
+//
+// These get re-created and updated inside the codebase as necessary,
+// but are generally shared between Goroutines through helper functions.
+
+// See getKinesisClient()
+var kinesisClient *kinesis.Kinesis
+
 var sigs = make(chan os.Signal, 1)
 var restart = make(chan bool, 1)
 var shutdown = make(chan bool, 1)
@@ -143,6 +160,20 @@ func print(a ...interface{}) {
 	fmt.Fprintln(os.Stdout, file, ":", line, " ", fmt.Sprint(a...))
 }
 
+// Wrapper that allows us to get a single global kinesisClient object if it exists,
+// create-and-get it if its nil, or forcefully recreate it if necessary.
+//
+// By storing the object globally in the package,
+// we also have the ability to inject custom settings for the testing framework.
+func getKinesisClient(force bool) *kinesis.Kinesis {
+	if !force && kinesisClient != nil {
+		return kinesisClient
+	}
+
+	kinesisClient := kinesis.New(session.New(aws.NewConfig()))
+	return kinesisClient
+}
+
 /*
 	new algo:
 		- pull down every record
@@ -152,11 +183,14 @@ func print(a ...interface{}) {
 */
 func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry, errorChan chan<- error) {
 	for !done.IsSet() {
-		kinesisClient := kinesis.New(session.New(aws.NewConfig()))
 		buffer := make([]*kinesis.PutRecordsRequestEntry, 0)
 		seenUniqRecords := make(map[string]bool)
 		lastFlush := time.Now()
 		bufSize := 0
+
+		// Lazily ensure our kinesisClient is up to date
+		kinesisClient = getKinesisClient(false)
+
 		var lastCommitMsgInBuffer *pgx.WalMessage
 		var pre *putRecordEntry
 
@@ -185,7 +219,6 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 			// the message size is the data blob length + the partition key size
 			msgSize := 0
 			partitionKey := ""
-
 			if pre != nil {
 				msgSize = len(pre.json) + len([]byte(*pre.key))
 				partitionKey = *pre.key
@@ -215,7 +248,8 @@ func putRecordWorker(chanIdx int, stream *string, records <-chan *putRecordEntry
 
 					if err != nil {
 						logerror(errors.Wrapf(err, "kinesis PutRecords failed; retrying failed records in %s", retryDuration.String()))
-						kinesisClient = kinesis.New(session.New(aws.NewConfig())) // refresh the client to get new credentials etc.
+						// refreshes the client to get new credentials
+						kinesisClient = getKinesisClient(true)
 						time.Sleep(retryDuration)
 						continue
 					} else if *out.FailedRecordCount > 0 {
@@ -314,13 +348,7 @@ func marshalWALToJSON(pr *parselogical.ParseResult, msg *pgx.ReplicationMessage)
 		}
 	}
 
-	return json.Marshal(struct {
-		Time      *string                                  `json:"time"`
-		Lsn       *string                                  `json:"lsn"`
-		Table     *string                                  `json:"table"`
-		Operation *string                                  `json:"operation"`
-		Columns   *map[string]map[string]map[string]string `json:"columns"`
-	}{
+	return json.Marshal(&jsonWalEntry{
 		Time:      &time,
 		Lsn:       &lsn,
 		Table:     &pr.Relation,
@@ -725,35 +753,35 @@ func connectReplicateLoop(slot *string, sourceConfig pgx.ConnConfig, stream *str
 	return nil
 }
 
-func createReplicationSlot(slot *string, sourceConfig pgx.ConnConfig) error {
+func createReplicationSlot(slot string, sourceConfig pgx.ConnConfig) error {
 	conn, err := pgx.ReplicationConnect(sourceConfig)
 	if err != nil {
 		return errors.Wrapf(err, "unable to establish connection to source DB %s/%s", sourceConfig.Host, sourceConfig.Database)
 	}
 	defer conn.Close()
 
-	err = conn.CreateReplicationSlot(*slot, "test_decoding")
+	err = conn.CreateReplicationSlot(slot, "test_decoding")
 	if err != nil {
-		return errors.Wrapf(err, "unable to create slot %s", *slot)
+		return errors.Wrapf(err, "unable to create slot %s", slot)
 	}
 
-	logf("created replication slot %s", *slot)
+	logf("created replication slot %s", slot)
 	return nil
 }
 
-func dropReplicationSlot(slot *string, sourceConfig pgx.ConnConfig) error {
+func dropReplicationSlot(slot string, sourceConfig pgx.ConnConfig) error {
 	conn, err := pgx.ReplicationConnect(sourceConfig)
 	if err != nil {
 		return errors.Wrapf(err, "unable to establish connection to source DB %s/%s", sourceConfig.Host, sourceConfig.Database)
 	}
 	defer conn.Close()
 
-	err = conn.DropReplicationSlot(*slot)
+	err = conn.DropReplicationSlot(slot)
 	if err != nil {
-		return errors.Wrapf(err, "unable to drop slot %s", *slot)
+		return errors.Wrapf(err, "unable to drop slot %s", slot)
 	}
 
-	logf("dropped replication slot %s", *slot)
+	logf("dropped replication slot %s", slot)
 	return nil
 }
 
@@ -785,6 +813,66 @@ func signalHandler() {
 	case shutdown <- true:
 	default:
 	}
+}
+
+func mainLoop(slot string, drop bool, create bool, stream string,
+	retryInitial bool, sourceConfig pgx.ConnConfig) error {
+
+	if create {
+		err := createReplicationSlot(slot, sourceConfig)
+		logerror(err)
+
+		if err != nil {
+			if strings.HasSuffix(err.Error(), "(SQLSTATE 42710)") {
+				logf("replication slot %s already exists, continuing", slot)
+			} else {
+				os.Exit(1)
+			}
+		}
+	}
+
+	if drop {
+		err := dropReplicationSlot(slot, sourceConfig)
+		logerror(err)
+
+		if err != nil {
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	tablesToStream = make(map[string]bool)
+
+	go signalHandler()
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+	for !done.IsSet() {
+		err := connectReplicateLoop(&slot, sourceConfig, &stream)
+		logerror(err)
+
+		if !initiallyConnected && !retryInitial {
+			logerrf("failed to connect initially, exiting; if you wish to retry on the initial connection (for a HA setup), set --retry-initial")
+			os.Exit(1)
+		}
+
+		if !done.IsSet() {
+			// non-blocking send to restart
+			select {
+			case restart <- true:
+			default:
+			}
+
+			if initiallyConnected {
+				time.Sleep(ReconnectInterval)
+			} else {
+				time.Sleep(InitialReconnectInterval)
+			}
+		} else {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func main() {
@@ -851,60 +939,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *create {
-		err := createReplicationSlot(slot, sourceConfig)
-		logerror(err)
+	// Blocking call to the main loop..
+	err = mainLoop(*slot, *drop, *create, *stream, *retryInitial, sourceConfig)
 
-		if err != nil {
-			if strings.HasSuffix(err.Error(), "(SQLSTATE 42710)") {
-				logf("replication slot %s already exists, continuing", *slot)
-			} else {
-				os.Exit(1)
-			}
-		}
+	if err != nil {
+		os.Exit(1)
 	}
-
-	if *drop {
-		err := dropReplicationSlot(slot, sourceConfig)
-		logerror(err)
-
-		if err != nil {
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}
-
-	tablesToStream = make(map[string]bool)
-
-	go signalHandler()
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-
-	for !done.IsSet() {
-		err := connectReplicateLoop(slot, sourceConfig, stream)
-		logerror(err)
-
-		if !initiallyConnected && !*retryInitial {
-			logerrf("failed to connect initially, exiting; if you wish to retry on the initial connection (for a HA setup), set --retry-initial")
-			os.Exit(1)
-		}
-
-		if !done.IsSet() {
-			// non-blocking send to restart
-			select {
-			case restart <- true:
-			default:
-			}
-
-			if initiallyConnected {
-				time.Sleep(ReconnectInterval)
-			} else {
-				time.Sleep(InitialReconnectInterval)
-			}
-		} else {
-			if err != nil {
-				os.Exit(1)
-			}
-			os.Exit(0)
-		}
-	}
+	os.Exit(0)
 }

@@ -1,1 +1,4 @@
 pg_kinesis
+*.sw*
+.idea
+vendor
